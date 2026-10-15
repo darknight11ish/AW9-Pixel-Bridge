@@ -68,4 +68,5 @@ jobs:
           files: |
             app/build/outputs/apk/debug/*.apk
             app/build/outputs/apk/release/*.apk
+          fail_on_unmatched_files: true
           generate_release_notes: true

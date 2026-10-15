@@ -11,8 +11,8 @@ android {
         applicationId = "com.bridge.applewatch"
         minSdk = 34
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -60,9 +60,12 @@ android {
         unitTests.isReturnDefaultValues = true
     }
     lint {
-        abortOnError = false
-        checkDependencies = false
+        // Keep the gate meaningful: Error-severity checks (MissingPermission, NewApi,
+        // ExportedService, ...) fail the build again, while the Warning-severity
+        // dependency/targetSdk checks that this project cannot resolve do not (D-10).
+        abortOnError = true
         warningsAsErrors = false
+        checkDependencies = false
     }
 }
 

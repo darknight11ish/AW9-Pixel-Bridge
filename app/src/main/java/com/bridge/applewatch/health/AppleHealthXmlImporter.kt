@@ -15,7 +15,18 @@ object AppleHealthXmlImporter {
 
     private val appleDateFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss Z")
 
-    fun parseExportXmlStream(inputStream: InputStream, maxRecords: Int = 5000): List<Record> {
+    /**
+     * Apple's HRV metric is SDNN while Health Connect's only record type is
+     * [HeartRateVariabilityRmssdRecord]; the two are not interchangeable (D-05).
+     * SDNN import therefore requires an explicit opt-in and is skipped by default.
+     */
+    const val IMPORT_SDNN_AS_RMSSD: Boolean = false
+
+    fun parseExportXmlStream(
+        inputStream: InputStream,
+        maxRecords: Int = 5000,
+        includeSdnnAsRmssd: Boolean = IMPORT_SDNN_AS_RMSSD
+    ): List<Record> {
         val records = mutableListOf<Record>()
         val parser = Xml.newPullParser()
         parser.setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
@@ -29,7 +40,7 @@ object AppleHealthXmlImporter {
                 val endStr = parser.getAttributeValue(null, "endDate") ?: ""
                 val valueStr = parser.getAttributeValue(null, "value") ?: ""
 
-                val record = mapXmlNodeToRecord(type, startStr, endStr, valueStr)
+                val record = mapXmlNodeToRecord(type, startStr, endStr, valueStr, includeSdnnAsRmssd)
                 if (record != null) {
                     records.add(record)
                 }
@@ -43,7 +54,8 @@ object AppleHealthXmlImporter {
         type: String,
         startDateStr: String,
         endDateStr: String,
-        valueStr: String
+        valueStr: String,
+        includeSdnnAsRmssd: Boolean = IMPORT_SDNN_AS_RMSSD
     ): Record? {
         val startInstant = parseAppleTimestamp(startDateStr) ?: return null
         val endInstant = parseAppleTimestamp(endDateStr)?.let {
@@ -107,7 +119,9 @@ object AppleHealthXmlImporter {
                 )
             }
             "HKQuantityTypeIdentifierHeartRateVariabilitySDNN" -> {
-                if (numericVal !in 1.0..250.0) null else HeartRateVariabilityRmssdRecord(
+                // Health Connect has no SDNN record type; writing SDNN into
+                // HeartRateVariabilityRmssdRecord would mislabel the metric (D-05).
+                if (!includeSdnnAsRmssd || numericVal !in 1.0..250.0) null else HeartRateVariabilityRmssdRecord(
                     time = startInstant,
                     zoneOffset = offset,
                     heartRateVariabilityMillis = numericVal,

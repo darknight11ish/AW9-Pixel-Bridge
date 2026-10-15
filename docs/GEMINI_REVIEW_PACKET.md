@@ -2,7 +2,7 @@
 
 **Purpose.** This is a self-contained review packet for an external reviewer model (Gemini). It contains the complete source of every delivered file, the exact build/CI evidence, and — most importantly — a forensic account of every place where the delivered implementation **deliberately departs from the attached specification**, because those departures are the result of an artifact-verified build failure, not of authorial preference.
 
-**Short path for a reviewer:** §1 (what shipped), §2 (the conflict you must adjudicate), §5 (build evidence), §6 (every deviation, justified), §9 (defect register), §10 (externally verified API ground truth), §11 (**the seven questions I need answered**). §7 contains the complete source of every file and can be read selectively.
+**Short path for a reviewer:** §1 (what shipped), §2 (the conflict you must adjudicate), §5 (build evidence), §6 (every deviation, justified), §9 (defect register), §10 (externally verified API ground truth), §11 (**the seven questions I need answered**). §7 contains the complete source of every file and can be read selectively. **§14 is the v1.0.1 remediation addendum**, added after adjudication.
 
 ---
 
@@ -2973,3 +2973,92 @@ ec149ad ci: align provisioned build-tools with compileSdk 36
 ---
 
 *End of review packet. Generated from the built repository at commit `ec149ad46babb36e91dcd7056e8d4ccb2575500a`; every hash above was computed from the committed bytes.*
+
+---
+
+## 14. v1.0.1 remediation addendum
+
+This section was added after the reviewer's adjudication. It records what changed between the v1.0.0 baseline
+and v1.0.1, and — where the adjudication and the code disagreed — what the code actually does.
+
+### 14.1 Disposition of the reviewer's answers
+
+| Reviewer finding | Requested action | Shipped in v1.0.1 | Where |
+|---|---|---|---|
+| Q1 toolchain upgrade approved | Keep compileSdk 36 / AGP 8.9.1 / Gradle 8.11.1, keep stable connect-client 1.1.0 | Unchanged. No further toolchain churn. | `build.gradle.kts`, `gradle-wrapper.properties` |
+| Q2 `lint { abortOnError = false }` | Restore `abortOnError = true`, keep `warningsAsErrors = false` | Done. **Confirmed empirically:** `lintDebug` now runs with the gate live and still passes with 0 errors / 8 warnings. | `app/build.gradle.kts` |
+| Q3 D-01 fabricated SpO2 | `spo2` default `-1.0`; read real `.oxygenSaturation` samples | Done, exactly as specified. | `WatchBridgeAgent.swift:27`, new `oxygenSaturation` case |
+| Q4 D-02 unauthenticated LAN endpoint | Keep cleartext, add peer restriction and optional token | Peer restriction shipped (`isPrivateNetworkAddress`, 403 otherwise). Cleartext retained deliberately. | `WatchBridgeService.kt` |
+| Q5 D-04 GATT queue | Check return values; add a 3 s watchdog per operation | Done. Return values of `writeDescriptor`/`readCharacteristic` are checked and the queue advances on synchronous failure; a 3,000 ms coroutine watchdog advances a dropped operation. | `WatchBridgeService.kt` |
+| Q6 test suite | 5 additional tests | Done — **11 tests, all passing** (5 original + 6 new). | `BlePacketParserTest.kt` |
+| Q7 new findings | D-12, D-13, D-14 | All three fixed. | `WatchBridgeService.kt` |
+| D-03, D-05, D-06, D-08, D-10, D-11 | Triage table items | All fixed. | see §14.2 |
+
+### 14.2 Deviation from the adjudicated directive, and why
+
+The reviewer's Q6 asked for an RMSSD artifact test asserting that
+`listOf(800.0, 1000.0, 1500.0, 1200.0)` yields `0.0`. **That expectation is not what the parser
+does, and the parser is correct.**
+
+Deltas for that input are `+200`, `+500`, `-300`. The filter condition at `BlePacketParser.kt:156` is
+`abs(diff) <= 350`, so `+200` **and** `-300` are admissible and only `+500` is rejected. The correct
+value is therefore `sqrt((200^2 + 300^2) / 2) = sqrt(65000) = 254.95 -> 255.0 ms`, not `0.0`.
+
+Rather than weaken the test to match the directive, v1.0.1 asserts the true behaviour at three points:
+the ectopic case `[800, 820, 1400, 830]` -> `20.0` (only the `+20` pair survives), an all-artifact case
+`[800, 1300, 1800]` -> `0.0` (no admissible pairs), and the mixed case above -> `255.0`. Three of my own
+first-draft expectations in this test were also wrong and were corrected against the implementation; the
+implementation was never changed to satisfy a test.
+
+### 14.3 Full v1.0.1 change map
+
+| ID | Fix | File |
+|---|---|---|
+| D-01 | `spo2` default is `-1.0`; `HKQuantityTypeIdentifier.oxygenSaturation` case added, normalising `.percent()` (0..1) to 0..100. With no reading, `-1.0` reaches the Android range check and no record is written. | `watchos-companion/WatchBridgeAgent.swift` |
+| D-02 | `isPrivateNetworkAddress()` gates `handleHttpConnection`; non-private peers receive `403 Forbidden`. Loopback, 10/8, 192.168/16, 169.254/16, 172.16/12, IPv4-mapped, `fe80::/10` and `fc00::/7` are accepted. | `WatchBridgeService.kt` |
+| D-03 | `runtimeBleLauncher` now consumes the granted map and only calls `startForegroundService` when `BLUETOOTH_CONNECT` **and** `BLUETOOTH_SCAN` are granted; otherwise it logs via `appendExternalLog`. | `MainActivity.kt` |
+| D-04 | `writeDescriptor != BluetoothStatusCodes.SUCCESS` and `readCharacteristic == false` advance the queue immediately; `armGattWatchdog()` advances it after 3,000 ms using a token so a stale watchdog cannot skip a newer operation. | `WatchBridgeService.kt` |
+| D-05 | SDNN import into `HeartRateVariabilityRmssdRecord` is gated behind `IMPORT_SDNN_AS_RMSSD` (default `false`), with the metric mismatch documented at the call site. | `AppleHealthXmlImporter.kt` |
+| D-06 | `@Volatile isShuttingDown` is set before teardown; the accept loop suppresses the resulting `SocketException` log. | `WatchBridgeService.kt` |
+| D-08 | `client` is now `HealthConnectClient?`, populated only when `getSdkStatus(context) == SDK_AVAILABLE`; every write path returns early when null and `isAvailable` is exposed. | `HealthConnectManager.kt` |
+| D-10 | `abortOnError = true`, `warningsAsErrors = false`, `checkDependencies = false`. | `app/build.gradle.kts` |
+| D-11 | `fail_on_unmatched_files: true` on the release step. | `.github/workflows/android-ci.yml` |
+| D-12 | `@Volatile isBleConnecting` gate set before `connectGatt`, cleared on `STATE_CONNECTED`/`STATE_DISCONNECTED`, and also cleared if `connectGatt` throws or returns null. | `WatchBridgeService.kt` |
+| D-13 | `shouldAcceptContinuityFrame()` requires the tracked MAC once known and otherwise a `> -80 dBm` floor; RSSI is smoothed with an EMA (`0.3*new + 0.7*previous`). | `WatchBridgeService.kt` |
+| D-14 | `lastCumulativeSteps` sentinel is `-1L`; the first payload establishes the baseline with `stepDelta = 0`, so a day's backlog is never written into one 60-second window. | `WatchBridgeService.kt` |
+
+### 14.4 v1.0.1 verification
+
+```text
+> .\gradlew.bat testDebugUnitTest lintDebug assembleDebug assembleRelease --parallel --no-daemon
+BUILD SUCCESSFUL
+###GRADLE_EXIT=0
+```
+
+| Gate | Result |
+|---|---|
+| Unit tests | **11 tests, 0 failures, 0 errors, 0 skipped** |
+| Lint (`abortOnError = true`) | **0 errors, 0 fatal, 8 warnings** (`GradleDependency` x6, `DataExtractionRules` x1, `OldTargetApi` x1) |
+| `assembleDebug` | `app-debug.apk` — versionCode 2, versionName 1.0.1-debug, `apksigner` verified |
+| `assembleRelease` | `app-release.apk` — versionCode 2, versionName 1.0.1, R8-minified, `apksigner` verified |
+
+The three new pure-logic tests exercise paths that were previously untested: the RMSSD
+artifact-rejection branch and the `size < 3` guard, truncated-packet null safety for both the HR and
+RSC/Continuity parsers, and `estimateDistanceMeters` boundary handling plus monotonicity across
+`-60 .. -110 dBm`.
+
+### 14.5 Residual risks carried forward (not fixed in v1.0.1)
+
+* **D-02 is mitigation, not authentication.** Restricting to private address space does not stop a
+  hostile device already on the same Wi-Fi from driving `/control`. The reviewer's own recommendation was
+  peer restriction *plus* an optional shared token; the token is **not implemented**. Treat the control
+  endpoint as trusted-LAN-only.
+* **D-07** (sync-count over-reporting and second-granular record IDs) is unchanged — it was not in the
+  v1.0.1 mandate.
+* **D-09** (`CAMERA_SHUTTER` returning success on a swallowed failure) is unchanged.
+* **`isBleConnecting` has no timeout.** If the controller never reports `STATE_CONNECTED` *or*
+  `STATE_DISCONNECTED`, reconnection stays gated. This is strictly safer than the connection storm it
+  replaces, but a connect timeout would be the complete fix.
+* **D-12/D-13/D-14 have no unit tests** — they live in `WatchBridgeService`, which requires
+  Robolectric or instrumentation to exercise. The logic that *was* extracted to pure functions
+  (`isPrivateNetworkAddress`) is likewise not yet covered.

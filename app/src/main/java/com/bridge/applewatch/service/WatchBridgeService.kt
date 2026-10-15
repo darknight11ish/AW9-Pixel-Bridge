@@ -44,6 +44,34 @@ class WatchBridgeService : Service() {
         val BATTERY_LEVEL_CHAR_UUID: UUID = UUID.fromString("00002a19-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+        /** Bumped by the GATT watchdog alongside a queued operation. */
+        private const val WATCHDOG_TIMEOUT_MS = 3_000L
+
+        /**
+         * True only for loopback and RFC1918 (site-local) peers. 172.16/12 is not
+         * covered by [java.net.InetAddress.isSiteLocalAddress], so it is matched
+         * explicitly; the server also relies on the cleartext HTTP connection.
+         */
+        internal fun isPrivateNetworkAddress(host: String?): Boolean {
+            if (host.isNullOrBlank()) return false
+            if (host == "::1" || host == "127.0.0.1" || host.startsWith("127.")) return true
+            // IPv4-mapped IPv6 loopback, e.g. ::ffff:127.0.0.1
+            if (host.startsWith("::ffff:")) return isPrivateNetworkAddress(host.substringAfter("::ffff:"))
+            if (host.startsWith("10.") || host.startsWith("192.168.")) return true
+            if (host.startsWith("169.254.")) return true
+            if (host.startsWith("172.")) {
+                val second = host.split(".").getOrNull(1)?.toIntOrNull() ?: return false
+                return second in 16..31
+            }
+            // Link-local IPv6 (fe80::/10) and unique-local IPv6 (fc00::/7)
+            val lower = host.lowercase()
+            if (lower.startsWith("fe8") || lower.startsWith("fe9") ||
+                lower.startsWith("fea") || lower.startsWith("feb")
+            ) return true
+            if (lower.startsWith("fc") || lower.startsWith("fd")) return true
+            return false
+        }
+
         fun appendExternalLog(message: String, xmlCountDelta: Int = 0) {
             val current = _telemetry.value
             val updatedLogs = (listOf("[${LocalTime.now().withNano(0)}] $message") + current.recentLogs).take(25)
@@ -67,9 +95,31 @@ class WatchBridgeService : Service() {
     private val gattOperationQueue = ConcurrentLinkedQueue<Runnable>()
     @Volatile private var isGattOperationInProgress = false
 
+    /** Incremented every time an operation is pulled off the queue; the watchdog compares it. */
+    @Volatile private var gattOperationToken = 0L
+    private var gattWatchdogJob: Job? = null
+
+    /** Prevents a connectGatt() storm while the first connection handshake is in flight (D-12). */
+    @Volatile private var isBleConnecting = false
+
+    /** Set before closing the listener so a deliberate shutdown is not logged as an error (D-06). */
+    @Volatile private var isShuttingDown = false
+
+    /** MAC address of the device we are tracking, populated inside onScanResult (D-13). */
+    @Volatile private var trackedWatchAddress: String? = null
+
+    /** Exponential moving average of RSSI, 0.0 until the first sample (D-13). */
+    @Volatile private var smoothedRssi: Double = 0.0
+
     private val rrHistoryMs = ArrayDeque<Double>(32)
     private val hrSampleBuffer = Collections.synchronizedList(mutableListOf<HeartRateRecord.Sample>())
-    private var lastCumulativeSteps = 0L
+
+    /**
+     * Cumulative step counter seen in the last webhook. A sentinel of -1L means
+     * "not yet baselined", so the first payload establishes the baseline instead
+     * of being written into Health Connect as a single 60-second window (D-14).
+     */
+    private var lastCumulativeSteps = -1L
 
     override fun onCreate() {
         super.onCreate()
@@ -133,14 +183,22 @@ class WatchBridgeService : Service() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val record = result.scanRecord ?: return
             val rssi = result.rssi
-            val distMeters = BlePacketParser.estimateDistanceMeters(rssi)
+            val deviceAddress = result.device.address
 
             val appleBytes = record.getManufacturerSpecificData(APPLE_COMPANY_ID)
-            if (appleBytes != null) {
+            if (appleBytes != null && shouldAcceptContinuityFrame(deviceAddress, rssi)) {
                 BlePacketParser.parseAppleContinuityManufacturerData(appleBytes)?.let { parsed ->
+                    // EMA smoothing keeps the proximity readout from flickering between
+                    // the many Apple devices broadcasting 0x004C nearby (D-13).
+                    val smoothed = if (smoothedRssi == 0.0) {
+                        rssi.toDouble()
+                    } else {
+                        0.3 * rssi + 0.7 * smoothedRssi
+                    }
+                    smoothedRssi = smoothed
                     _telemetry.value = _telemetry.value.copy(
-                        rssi = rssi,
-                        estimatedMeters = distMeters,
+                        rssi = smoothed.toInt(),
+                        estimatedMeters = BlePacketParser.estimateDistanceMeters(smoothed.toInt()),
                         continuityState = parsed.activityLevelDescription
                     )
                 }
@@ -148,21 +206,48 @@ class WatchBridgeService : Service() {
 
             val uuids = record.serviceUuids?.map { it.uuid } ?: emptyList()
             val devName = result.device.name ?: ""
-            if (!_telemetry.value.isBleConnected &&
-                (uuids.contains(HRS_SERVICE_UUID) || uuids.contains(RSC_SERVICE_UUID) ||
-                    devName.contains("Apple Watch", ignoreCase = true))
-            ) {
-                _telemetry.value = _telemetry.value.copy(
-                    watchName = devName.ifEmpty { "Apple Watch Series 9" },
-                    watchMacAddress = result.device.address
-                )
-                activeGatt = result.device.connectGatt(
-                    this@WatchBridgeService,
-                    true,
-                    gattCallback,
-                    BluetoothDevice.TRANSPORT_LE
-                )
+            val matchesBridge =
+                uuids.contains(HRS_SERVICE_UUID) || uuids.contains(RSC_SERVICE_UUID) ||
+                    devName.contains("Apple Watch", ignoreCase = true)
+            if (matchesBridge) {
+                if (deviceAddress.isNotBlank()) trackedWatchAddress = deviceAddress
+                if (!_telemetry.value.isBleConnected && !isBleConnecting) {
+                    isBleConnecting = true
+                    _telemetry.value = _telemetry.value.copy(
+                        watchName = devName.ifEmpty { "Apple Watch Series 9" },
+                        watchMacAddress = deviceAddress
+                    )
+                    try {
+                        activeGatt = result.device.connectGatt(
+                            this@WatchBridgeService,
+                            true,
+                            gattCallback,
+                            BluetoothDevice.TRANSPORT_LE
+                        )
+                        if (activeGatt == null) {
+                            isBleConnecting = false
+                            logEvent("connectGatt returned null for $deviceAddress")
+                        }
+                    } catch (e: Exception) {
+                        // Never leave the gate latched if the stack refuses the call.
+                        isBleConnecting = false
+                        logEvent("connectGatt failed for $deviceAddress: ${e.message}")
+                    }
+                }
             }
+        }
+    }
+
+    /**
+     * Rejects 0x004C frames from nearby iPhones/Macs once the watch MAC is known,
+     * and otherwise requires a strong-enough signal to be plausibly the watch.
+     */
+    private fun shouldAcceptContinuityFrame(deviceAddress: String, rssi: Int): Boolean {
+        val tracked = trackedWatchAddress
+        return when {
+            tracked.isNullOrBlank() -> rssi > -80
+            deviceAddress.equals(tracked, ignoreCase = true) -> true
+            else -> false
         }
     }
 
@@ -174,28 +259,51 @@ class WatchBridgeService : Service() {
     }
 
     private fun executeNextGattOperation() {
+        gattWatchdogJob?.cancel()
+        gattWatchdogJob = null
         val next = gattOperationQueue.poll()
         if (next == null) {
             isGattOperationInProgress = false
             return
         }
+        val token = ++gattOperationToken
         isGattOperationInProgress = true
+        armGattWatchdog(token)
         next.run()
+    }
+
+    /**
+     * If the controller drops a callback (busy radio, link still encrypting) the
+     * queue would otherwise stay locked forever. The watchdog advances it instead (D-04).
+     */
+    private fun armGattWatchdog(token: Long) {
+        gattWatchdogJob = serviceScope.launch {
+            delay(WATCHDOG_TIMEOUT_MS)
+            if (isActive && token == gattOperationToken && isGattOperationInProgress) {
+                logEvent("GATT operation timed out after ${WATCHDOG_TIMEOUT_MS}ms — advancing queue")
+                executeNextGattOperation()
+            }
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                isBleConnecting = false
                 _telemetry.value = _telemetry.value.copy(
                     isBleConnected = true,
                     watchName = gatt.device.name ?: "Apple Watch Series 9",
                     watchMacAddress = gatt.device.address
                 )
+                trackedWatchAddress = gatt.device.address
                 logEvent("BLE GATT Connected to ${gatt.device.address}")
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                isBleConnecting = false
                 isGattOperationInProgress = false
                 gattOperationQueue.clear()
+                gattWatchdogJob?.cancel()
+                gattWatchdogJob = null
                 _telemetry.value = _telemetry.value.copy(
                     isBleConnected = false,
                     sensorContactOnWrist = false
@@ -211,9 +319,12 @@ class WatchBridgeService : Service() {
                 enqueueGattOperation(Runnable {
                     gatt.setCharacteristicNotification(char, true)
                     val desc = char.getDescriptor(CCCD_UUID)
-                    if (desc != null) {
-                        gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                    } else {
+                    if (desc == null) {
+                        executeNextGattOperation()
+                    } else if (gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        != BluetoothStatusCodes.SUCCESS
+                    ) {
+                        logEvent("CCCD write rejected for 0x2A37 — skipping notify registration")
                         executeNextGattOperation()
                     }
                 })
@@ -223,9 +334,12 @@ class WatchBridgeService : Service() {
                 enqueueGattOperation(Runnable {
                     gatt.setCharacteristicNotification(char, true)
                     val desc = char.getDescriptor(CCCD_UUID)
-                    if (desc != null) {
-                        gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                    } else {
+                    if (desc == null) {
+                        executeNextGattOperation()
+                    } else if (gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                        != BluetoothStatusCodes.SUCCESS
+                    ) {
+                        logEvent("CCCD write rejected for 0x2A53 — skipping notify registration")
                         executeNextGattOperation()
                     }
                 })
@@ -233,12 +347,18 @@ class WatchBridgeService : Service() {
 
             gatt.getService(BATTERY_SERVICE_UUID)?.getCharacteristic(BATTERY_LEVEL_CHAR_UUID)?.let { char ->
                 enqueueGattOperation(Runnable {
-                    gatt.readCharacteristic(char)
+                    if (!gatt.readCharacteristic(char)) {
+                        logEvent("Battery read rejected by controller")
+                        executeNextGattOperation()
+                    }
                 })
             }
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                logEvent("CCCD descriptor write failed with status $status")
+            }
             executeNextGattOperation()
         }
 
@@ -320,7 +440,9 @@ class WatchBridgeService : Service() {
                     launch { handleHttpConnection(client) }
                 }
             } catch (e: Exception) {
-                logEvent("HTTP Server Error: ${e.message}")
+                if (!isShuttingDown) {
+                    logEvent("HTTP Server Error: ${e.message}")
+                }
             }
         }
     }
@@ -329,6 +451,23 @@ class WatchBridgeService : Service() {
         socket.use { client ->
             val reader = BufferedReader(InputStreamReader(client.getInputStream()))
             val writer = PrintWriter(client.getOutputStream(), true)
+
+            // Only loopback / private LAN peers may drive the bridge (D-02). This is
+            // defence in depth on top of the Wi-Fi-only assumption; it does not
+            // authenticate the peer.
+            val remoteHost = client.inetAddress?.hostAddress
+            if (!isPrivateNetworkAddress(remoteHost)) {
+                logEvent("HTTP connection refused from non-private peer $remoteHost")
+                writer.print(
+                    "HTTP/1.1 403 Forbidden\r\n" +
+                        "Content-Type: application/json\r\n" +
+                        "Content-Length: 34\r\n" +
+                        "Connection: close\r\n\r\n" +
+                        """{"status":"forbidden","code":403}"""
+                )
+                writer.flush()
+                return
+            }
 
             val requestLine = reader.readLine() ?: return
             val parts = requestLine.split(" ")
@@ -416,11 +555,22 @@ class WatchBridgeService : Service() {
                 controlCommand = cmd
             )
 
-            val stepDelta = if (payload.steps > lastCumulativeSteps && payload.steps > 0) {
-                val d = payload.steps - lastCumulativeSteps
-                lastCumulativeSteps = payload.steps
-                d
-            } else 0L
+            val stepDelta = when {
+                payload.steps < 0 -> 0L
+                // First cumulative reading only establishes the baseline; writing it
+                // would dump the whole day's steps into one 60-second window (D-14).
+                lastCumulativeSteps < 0 -> {
+                    lastCumulativeSteps = payload.steps
+                    logEvent("Step baseline established at ${payload.steps}")
+                    0L
+                }
+                payload.steps > lastCumulativeSteps -> {
+                    val d = payload.steps - lastCumulativeSteps
+                    lastCumulativeSteps = payload.steps
+                    d
+                }
+                else -> 0L
+            }
 
             val writtenCount = healthManager.writeTelemetryPayload(payload, stepDelta)
 
@@ -474,6 +624,11 @@ class WatchBridgeService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        // Set before closing so the resulting SocketException is not logged as a
+        // failure and the listener is not re-created by a racing coroutine (D-06).
+        isShuttingDown = true
+        gattWatchdogJob?.cancel()
+        gattWatchdogJob = null
         try {
             bleScanner?.stopScan(scanCallback)
             activeGatt?.close()

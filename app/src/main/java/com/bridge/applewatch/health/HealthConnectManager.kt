@@ -12,7 +12,20 @@ import java.time.ZoneOffset
 
 class HealthConnectManager(context: Context) {
 
-    val client: HealthConnectClient = HealthConnectClient.getOrCreate(context)
+    /**
+     * Null when Health Connect is not installed, disabled, or needs an update (D-08).
+     * Previously the eager `getOrCreate` threw from the constructor, which surfaced as
+     * a crash before any user-facing explanation could be shown.
+     */
+    val client: HealthConnectClient? =
+        if (HealthConnectClient.getSdkStatus(context) == HealthConnectClient.SDK_AVAILABLE) {
+            HealthConnectClient.getOrCreate(context)
+        } else {
+            null
+        }
+
+    /** True when the on-device Health Connect provider is usable. */
+    val isAvailable: Boolean get() = client != null
 
     companion object {
         val REQUIRED_PERMISSIONS = setOf(
@@ -38,8 +51,9 @@ class HealthConnectManager(context: Context) {
     }
 
     suspend fun hasAllPermissions(): Boolean {
+        val hc = client ?: return false
         return try {
-            val granted = client.permissionController.getGrantedPermissions()
+            val granted = hc.permissionController.getGrantedPermissions()
             granted.containsAll(REQUIRED_PERMISSIONS)
         } catch (_: Exception) {
             false
@@ -47,6 +61,7 @@ class HealthConnectManager(context: Context) {
     }
 
     suspend fun flushHeartRateSamples(samples: List<HeartRateRecord.Sample>): Int {
+        val hc = client ?: return 0
         if (samples.isEmpty()) return 0
         val sorted = samples.sortedBy { it.time }
         val start = sorted.first().time
@@ -61,11 +76,12 @@ class HealthConnectManager(context: Context) {
             samples = sorted,
             metadata = Metadata.manualEntry(clientRecordId = "aw9_hr_${start.toEpochMilli()}")
         )
-        client.insertRecords(listOf(record))
+        hc.insertRecords(listOf(record))
         return sorted.size
     }
 
     suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant = Instant.now()) {
+        val hc = client ?: return
         if (rmssdMs !in 1.0..250.0) return
         val offset = ZoneOffset.systemDefault().rules.getOffset(timestamp)
         val record = HeartRateVariabilityRmssdRecord(
@@ -74,7 +90,7 @@ class HealthConnectManager(context: Context) {
             heartRateVariabilityMillis = rmssdMs,
             metadata = Metadata.manualEntry(clientRecordId = "aw9_hrv_${timestamp.epochSecond}")
         )
-        client.insertRecords(listOf(record))
+        hc.insertRecords(listOf(record))
     }
 
     suspend fun writeTelemetryPayload(
@@ -82,6 +98,7 @@ class HealthConnectManager(context: Context) {
         stepDelta: Long,
         now: Instant = Instant.now()
     ): Int {
+        val hc = client ?: return 0
         val offset = ZoneOffset.systemDefault().rules.getOffset(now)
         val windowStart = now.minusSeconds(60)
         val records = mutableListOf<Record>()
@@ -210,16 +227,17 @@ class HealthConnectManager(context: Context) {
         }
 
         if (records.isNotEmpty()) {
-            client.insertRecords(records)
+            hc.insertRecords(records)
         }
         return records.size
     }
 
     suspend fun insertBatchRecords(records: List<Record>): Int {
+        val hc = client ?: return 0
         if (records.isEmpty()) return 0
         var totalInserted = 0
         records.chunked(500).forEach { chunk ->
-            client.insertRecords(chunk)
+            hc.insertRecords(chunk)
             totalInserted += chunk.size
         }
         return totalInserted

@@ -24,7 +24,7 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     @Published var steps: Double = 0
     @Published var activeKcal: Double = 0
     @Published var distanceM: Double = 0
-    @Published var spo2: Double = 98.0
+    @Published var spo2: Double = -1.0
     @Published var floors: Double = 0
     @Published var hrvMs: Double = 0
     @Published var isStreaming = false
@@ -104,6 +104,15 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
                     self.activeKcal = stats.sumQuantity()?.doubleValue(for: .kilocalorie()) ?? self.activeKcal
                 case HKQuantityTypeIdentifier.distanceWalkingRunning.rawValue:
                     self.distanceM = stats.sumQuantity()?.doubleValue(for: .meter()) ?? self.distanceM
+                case HKQuantityTypeIdentifier.oxygenSaturation.rawValue:
+                    // HKUnit.percent() renders 98.5% as 0.985, so normalise to 0-100.
+                    // If no reading exists we keep -1.0, which makes the Android side's
+                    // 70.0..100.0 range check skip the record entirely rather than
+                    // writing a fabricated OxygenSaturationRecord.
+                    if let q = stats.mostRecentQuantity() {
+                        let pct = q.doubleValue(for: .percent())
+                        self.spo2 = pct <= 1.0 ? pct * 100.0 : pct
+                    }
                 case HKQuantityTypeIdentifier.flightsClimbed.rawValue:
                     self.floors = stats.sumQuantity()?.doubleValue(for: .count()) ?? self.floors
                 default: break
