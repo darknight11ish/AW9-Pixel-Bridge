@@ -89,7 +89,9 @@ jobs:
         run: |
           set -o pipefail
           SDK="$(xcrun --sdk watchos --show-sdk-path)"
-          swiftc -typecheck -sdk "$SDK" -target arm64-apple-watchos10.0 \
+          # -parse-as-library matches how Xcode compiles an app target; without it
+          # swiftc treats the file as a script and rejects @main.
+          swiftc -typecheck -parse-as-library -sdk "$SDK" -target arm64-apple-watchos10.0 \
             watchos-companion/WatchBridgeAgent.swift
           echo "watchOS type-check passed"
 

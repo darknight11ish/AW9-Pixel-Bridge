@@ -1,6 +1,5 @@
 import SwiftUI
 import HealthKit
-import CoreBluetooth
 import WatchKit
 
 @main
@@ -12,12 +11,19 @@ struct WatchBridgeAgentApp: App {
     }
 }
 
-final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiveWorkoutBuilderDelegate, CBPeripheralManagerDelegate {
+/// Streams Apple Watch Series 9 biometrics to the Pixel 9 bridge.
+///
+/// Transport note: watchOS does not expose the CoreBluetooth *peripheral* role —
+/// `CBPeripheralManager`, `CBMutableService` and `CBMutableCharacteristic` are all
+/// marked unavailable for watchOS — so the watch cannot advertise the standard
+/// Heart Rate service (0x180D / 0x2A37) as an earlier draft of this file attempted.
+/// Biometrics therefore travel over the HealthKit -> HTTP webhook path on port 8484,
+/// which is the same path the Android side already ingests. The Android BLE GATT
+/// client remains useful for standard third-party Heart Rate peripherals.
+final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiveWorkoutBuilderDelegate {
     private let healthStore = HKHealthStore()
     private var workoutSession: HKWorkoutSession?
     private var builder: HKLiveWorkoutBuilder?
-    private var peripheralManager: CBPeripheralManager?
-    private var hrCharacteristic: CBMutableCharacteristic?
 
     @Published var pixelIp: String = "192.168.1.100"
     /// Optional shared secret. Left empty the bridge accepts any private-LAN peer,
@@ -31,11 +37,11 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     @Published var floors: Double = 0
     @Published var hrvMs: Double = 0
     @Published var isStreaming = false
+    @Published var lastPushStatus: String = "Idle"
 
     override init() {
         super.init()
         WKInterfaceDevice.current().isBatteryMonitoringEnabled = true
-        peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
     }
 
     func startStreaming() {
@@ -71,25 +77,6 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
         }
     }
 
-    func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
-        guard peripheral.state == .poweredOn else { return }
-        let serviceUUID = CBUUID(string: "180D")
-        let charUUID = CBUUID(string: "2A37")
-        hrCharacteristic = CBMutableCharacteristic(
-            type: charUUID,
-            properties: [.notify],
-            value: nil,
-            permissions: [.readable]
-        )
-        let service = CBMutableService(type: serviceUUID, primary: true)
-        service.characteristics = [hrCharacteristic!]
-        peripheralManager?.add(service)
-        peripheralManager?.startAdvertising([
-            CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
-            CBAdvertisementDataLocalNameKey: "Apple Watch S9"
-        ])
-    }
-
     func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, didCollectDataOf collectedTypes: Set<HKSampleType>) {
         for type in collectedTypes {
             guard let quantityType = type as? HKQuantityType,
@@ -100,7 +87,6 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
                 case HKQuantityTypeIdentifier.heartRate.rawValue:
                     let bpmUnit = HKUnit.count().unitDivided(by: .minute())
                     self.liveBpm = Int(stats.mostRecentQuantity()?.doubleValue(for: bpmUnit) ?? 0)
-                    self.broadcastBleHeartRate(bpm: self.liveBpm)
                 case HKQuantityTypeIdentifier.stepCount.rawValue:
                     self.steps = stats.sumQuantity()?.doubleValue(for: .count()) ?? self.steps
                 case HKQuantityTypeIdentifier.activeEnergyBurned.rawValue:
@@ -118,17 +104,17 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
                     }
                 case HKQuantityTypeIdentifier.flightsClimbed.rawValue:
                     self.floors = stats.sumQuantity()?.doubleValue(for: .count()) ?? self.floors
+                case HKQuantityTypeIdentifier.heartRateVariabilitySDNN.rawValue:
+                    // The watch reports SDNN; the Android side only persists RMSSD and
+                    // gates SDNN separately, so this is carried for display/telemetry
+                    // and is not written to Health Connect as RMSSD.
+                    let msUnit = HKUnit.secondUnit(with: .milli)
+                    self.hrvMs = stats.mostRecentQuantity()?.doubleValue(for: msUnit) ?? self.hrvMs
                 default: break
                 }
                 self.postTelemetryToPixel(controlCommand: "")
             }
         }
-    }
-
-    private func broadcastBleHeartRate(bpm: Int) {
-        guard let char = hrCharacteristic, bpm > 0 else { return }
-        let packet = Data([0x06, UInt8(clamping: bpm)])
-        peripheralManager?.updateValue(packet, for: char, onSubscribedCentrals: nil)
     }
 
     func postTelemetryToPixel(controlCommand: String) {
@@ -153,12 +139,43 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
             "controlCommand": controlCommand
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        URLSession.shared.dataTask(with: req).resume()
+        URLSession.shared.dataTask(with: req) { _, response, error in
+            let status: String
+            if error != nil {
+                status = "Push failed"
+            } else if let http = response as? HTTPURLResponse {
+                switch http.statusCode {
+                case 200: status = "Synced"
+                case 401: status = "Rejected: bad bridge token"
+                case 403: status = "Rejected: peer not on local network"
+                default: status = "HTTP \(http.statusCode)"
+                }
+            } else {
+                status = "No response"
+            }
+            DispatchQueue.main.async { self.lastPushStatus = status }
+        }.resume()
     }
 
     func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}
-    func workoutSession(_ workoutSession: HKWorkoutSession, didChangeTo toState: HKWorkoutSessionState, from fromState: HKWorkoutSessionState, date: Date) {}
-    func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {}
+
+    func workoutSession(
+        _ workoutSession: HKWorkoutSession,
+        didChangeTo toState: HKWorkoutSessionState,
+        from fromState: HKWorkoutSessionState,
+        date: Date
+    ) {
+        // The session ending means no further samples will arrive, so reflect that
+        // in the UI instead of leaving the "Streaming Active" state latched.
+        if toState == .ended {
+            DispatchQueue.main.async { self.isStreaming = false }
+        }
+    }
+
+    func workoutSession(_ workoutSession: HKWorkoutSession, didFailWithError error: Error) {
+        print("HKWorkoutSession failed: \(error)")
+        DispatchQueue.main.async { self.isStreaming = false }
+    }
 }
 
 struct WatchBridgeView: View {
@@ -172,6 +189,9 @@ struct WatchBridgeView: View {
                 Text("\(streamer.liveBpm) BPM")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.red)
+                Text(streamer.lastPushStatus)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
                 Button(streamer.isStreaming ? "Streaming Active" : "Start Bridge") {
                     streamer.startStreaming()
                 }.tint(.green)
