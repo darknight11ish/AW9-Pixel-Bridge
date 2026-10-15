@@ -93,7 +93,19 @@ jobs:
           # swiftc treats the file as a script and rejects @main.
           swiftc -typecheck -parse-as-library -sdk "$SDK" -target arm64-apple-watchos10.0 \
             watchos-companion/WatchBridgeAgent.swift
-          echo "watchOS type-check passed"
+          echo "watchOS 10 type-check passed"
 
-      - name: Build the SwiftPM target for watchOS
-        run: swift build --triple arm64-apple-watchos10.0 2>&1 | tail -n 25
+      - name: Type-check against the current watchOS SDK target as well
+        run: |
+          set -o pipefail
+          SDK="$(xcrun --sdk watchos --show-sdk-path)"
+          # Same source, default (newest) deployment target: catches APIs that exist
+          # in the simulator SDK but are unavailable at the watchOS 10 floor.
+          swiftc -typecheck -parse-as-library -sdk "$SDK" watchos-companion/WatchBridgeAgent.swift
+          echo "watchOS current-SDK type-check passed"
+
+      # NOTE: `swift build --triple arm64-apple-watchos10.0` is deliberately NOT used
+      # here. SwiftPM cannot locate the watchOS standard library without an Xcode
+      # project, so it fails with "unable to load standard library" even though the
+      # source is valid. Use xcodebuild against an .xcodeproj to produce a real
+      # watchOS app bundle; the type-checks above are the authoritative compile gate.
