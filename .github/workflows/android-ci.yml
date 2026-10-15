@@ -36,7 +36,7 @@ jobs:
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           if [ ! -x "$SDKMANAGER" ]; then SDKMANAGER="sdkmanager"; fi
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --install "platforms;android-36" "build-tools;35.0.0" "platform-tools"
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "platform-tools"
 
       - name: Run JUnit Test Suite (BLE, Continuity, RMSSD, RSC)
         run: ./gradlew testDebugUnitTest --stacktrace
