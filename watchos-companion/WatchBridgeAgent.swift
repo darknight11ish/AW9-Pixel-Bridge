@@ -20,6 +20,9 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     private var hrCharacteristic: CBMutableCharacteristic?
 
     @Published var pixelIp: String = "192.168.1.100"
+    /// Optional shared secret. Left empty the bridge accepts any private-LAN peer,
+    /// so this stays backwards compatible with an unconfigured phone.
+    @Published var bridgeToken: String = ""
     @Published var liveBpm: Int = 0
     @Published var steps: Double = 0
     @Published var activeKcal: Double = 0
@@ -133,6 +136,10 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let trimmedToken = bridgeToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedToken.isEmpty {
+            req.setValue(trimmedToken, forHTTPHeaderField: "X-Bridge-Token")
+        }
         let battery = Int(max(0, WKInterfaceDevice.current().batteryLevel) * 100)
         let payload: [String: Any] = [
             "heartRate": liveBpm,
@@ -161,6 +168,7 @@ struct WatchBridgeView: View {
         ScrollView {
             VStack(spacing: 8) {
                 TextField("Pixel 9 IP", text: $streamer.pixelIp)
+                SecureField("Bridge token (optional)", text: $streamer.bridgeToken)
                 Text("\(streamer.liveBpm) BPM")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.red)

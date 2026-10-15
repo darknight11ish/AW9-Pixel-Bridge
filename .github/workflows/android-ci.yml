@@ -70,3 +70,28 @@ jobs:
             app/build/outputs/apk/release/*.apk
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  watchos-companion-typecheck:
+    # The watchOS companion cannot be compiled on Linux, so it gets its own macOS
+    # job. This is a real type-check against the watchOS SDK: it catches signature
+    # errors (e.g. HKUnit.percent() misuse), not just syntax problems.
+    runs-on: macos-14
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Show Swift and watchOS SDK versions
+        run: |
+          swift --version
+          xcrun --sdk watchos --show-sdk-path
+
+      - name: Type-check the watchOS companion against the watchOS SDK
+        run: |
+          set -o pipefail
+          SDK="$(xcrun --sdk watchos --show-sdk-path)"
+          swiftc -typecheck -sdk "$SDK" -target arm64-apple-watchos10.0 \
+            watchos-companion/WatchBridgeAgent.swift
+          echo "watchOS type-check passed"
+
+      - name: Build the SwiftPM target for watchOS
+        run: swift build --triple arm64-apple-watchos10.0 2>&1 | tail -n 25

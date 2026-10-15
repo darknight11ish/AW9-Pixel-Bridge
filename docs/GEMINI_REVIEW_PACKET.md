@@ -2,7 +2,7 @@
 
 **Purpose.** This is a self-contained review packet for an external reviewer model (Gemini). It contains the complete source of every delivered file, the exact build/CI evidence, and — most importantly — a forensic account of every place where the delivered implementation **deliberately departs from the attached specification**, because those departures are the result of an artifact-verified build failure, not of authorial preference.
 
-**Short path for a reviewer:** §1 (what shipped), §2 (the conflict you must adjudicate), §5 (build evidence), §6 (every deviation, justified), §9 (defect register), §10 (externally verified API ground truth), §11 (**the seven questions I need answered**). §7 contains the complete source of every file and can be read selectively. **§14 is the v1.0.1 remediation addendum**, added after adjudication.
+**Short path for a reviewer:** §1 (what shipped), §2 (the conflict you must adjudicate), §5 (build evidence), §6 (every deviation, justified), §9 (defect register), §10 (externally verified API ground truth), §11 (the seven questions). §7 contains the complete source. **§14 is the v1.0.1 remediation addendum** and **§15 the v1.0.2 addendum**.
 
 ---
 
@@ -13,13 +13,13 @@
 | Repository | https://github.com/darknight11ish/AW9-Pixel-Bridge |
 | Visibility | PUBLIC |
 | Default branch | `main` |
-| `main` HEAD (final, v1.0.1) | `68e06240d890411e03068b0856534c371e622255` |
+| `main` HEAD (v1.0.2 hardening) | `bf4384304df0342006624ef018fdad91b6b68cfd` |
 | v1.0.1 release commit | `68e06240d890411e03068b0856534c371e622255` |
 | v1.0.0 baseline commit | `8f791b438e7d29cfae92993bf40d3a322a7754fe` |
 | Tag objects | `v1.0.1` = `8bab75d487d1e8159f8b447ac714f8d3f1da6c9e`; `v1.0.0` = `6edaf6d7ddb3705e149ad2ceb032fb354a16d2ac` |
 | Releases | [`v1.0.1`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.1) (current, published 2026-10-15T19:34:31Z) and [`v1.0.0`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.0) (baseline, published 2026-10-15T02:38:12Z) |
 | Files committed | 28 |
-| Total committed bytes | 464,707 |
+| Total committed bytes | 484,496 |
 | Target platform | Google Pixel 9 (Android 14/15+, API 34-35) ⇄ Apple Watch Series 9 (watchOS 10/11+) |
 | Specification (archived verbatim in repo) | [`docs/AW9_PIXEL_BRIDGE_SPEC.md`](https://github.com/darknight11ish/AW9-Pixel-Bridge/blob/main/docs/AW9_PIXEL_BRIDGE_SPEC.md) (2,063 lines) |
 
@@ -2960,42 +2960,43 @@ On Windows use `gradlew.bat`; set `JAVA_HOME` to a JDK 17 install first.
 ## 13. Appendix — file inventory with hashes (review anchors)
 
 Use these to confirm you are reviewing the same bytes that were built and shipped.
-This inventory reflects **`main` at v1.0.1**.
+This inventory reflects **`main` at v1.0.2** (`bf4384304`).
 
 | Path | Lines | Bytes | SHA-256 |
 |---|---|---|---|
-| `.github/workflows/android-ci.yml` | 73 | 2,256 | `7dab2e5dd0bc779e1c672684ccd20f366d997903788536d0768b8b36ecc73217` |
+| `.github/workflows/android-ci.yml` | 98 | 3,229 | `8766fd2773ea8efea0910efccb1f4b7f5bba477af684cab452545ac49f693db8` |
 | `.gitignore` | 15 | 138 | `8af1b5039f29491a6ffbd317a1a94672e807996baea3a6c63878d0df6f214f1a` |
 | `README.md` | 35 | 1,845 | `47224ae9b287a4bb8cc3b0950a58ffcb5af7d2e04ad6ab16e91e97ea26c14550` |
-| `app/build.gradle.kts` | 94 | 2,881 | `cb7c34a0940feb292c62c25afe8ee7f41d423a34d92bcb0367bcdc15a1e863d3` |
+| `app/build.gradle.kts` | 101 | 3,229 | `98b3e2794ae30dc6cbd0480e94f83bdcd6f4ab81243aec8367d51c3786eb8abb` |
 | `app/proguard-rules.pro` | 4 | 123 | `412ff4e76e9aa557f5ceae6cd1d6c19572ab30f8c904c73639d944cb3cd30c79` |
 | `app/src/main/AndroidManifest.xml` | 76 | 4,171 | `0d2f5c7d4813e165be5f40d90d2e06b4ab4ae089e723ccca910361a0c04192ab` |
 | `app/src/main/java/com/bridge/applewatch/MainActivity.kt` | 343 | 14,206 | `92a54f70569534a99d32462c651269b27eaf7e6650950ac4d3d93bbc501b8b51` |
 | `app/src/main/java/com/bridge/applewatch/PermissionsRationaleActivity.kt` | 46 | 1,649 | `f49b66832951c22729cc891eddfdc8e7f6c4372eb2e1cd0fe165bb37e7f8d0a9` |
 | `app/src/main/java/com/bridge/applewatch/ble/BlePacketParser.kt` | 174 | 6,692 | `3c44a8239a4ba7b199369647e4ac0d4738f7074503afabfe69ded4584b92ae18` |
-| `app/src/main/java/com/bridge/applewatch/control/PixelControlDispatcher.kt` | 99 | 3,610 | `613e06ecde3e448415bd9d54480a7f3a7e2500e472c660de4c188a87c7481959` |
+| `app/src/main/java/com/bridge/applewatch/control/PixelControlDispatcher.kt` | 116 | 4,209 | `54704cef686849e59d670c189d329cd7a0f2e53e2e87ff01e1806cc73022a2f9` |
 | `app/src/main/java/com/bridge/applewatch/health/AppleHealthXmlImporter.kt` | 143 | 6,089 | `d49d500d48b996c5be35f5defd8a6b8584c864b2ce2f626360d87cc24673a0d4` |
-| `app/src/main/java/com/bridge/applewatch/health/HealthConnectManager.kt` | 246 | 9,557 | `8d0c3a3219c1cd9227cd5f2513f20f0d7f8b424c580fe6351e407d1945a00921` |
+| `app/src/main/java/com/bridge/applewatch/health/HealthConnectManager.kt` | 270 | 10,708 | `10f8da3a540c4622912417b2c36909f3357ebe0be6e69d1151e92776d834dac5` |
 | `app/src/main/java/com/bridge/applewatch/model/TelemetryModels.kt` | 68 | 2,090 | `05c841e58a832566bda1fb60c9681765231227b7bf13f94922ffc70bb5903d0d` |
-| `app/src/main/java/com/bridge/applewatch/service/WatchBridgeService.kt` | 641 | 28,680 | `42f0e335aaab430f23f75f82a70a83fa378077aef409f6194c38f3695890b607` |
+| `app/src/main/java/com/bridge/applewatch/service/WatchBridgeService.kt` | 727 | 31,615 | `1d6f60e848d190bc3ff28bfe43753bf37dbec046d16b3699fc8e0d9837b3c0d3` |
 | `app/src/main/res/drawable/ic_watch_bridge.xml` | 10 | 481 | `62c5494a65cd70dab1f879e178eb80b3336299be302ebd4a44ecec226b6426b1` |
 | `app/src/main/res/values/strings.xml` | 6 | 514 | `ca553ad45b595400f31d66f8d2cd24ed0a1206f3785b095328735fd3ebf88898` |
 | `app/src/test/java/com/bridge/applewatch/BlePacketParserTest.kt` | 140 | 5,768 | `ae18e48f2bc2a1c679d4330cab068a73278adc6f5ae7f02a0846f5659bf42395` |
 | `build.gradle.kts` | 5 | 142 | `a479fceabfc9d179c20d84e9f928463f659f1ffdcc514a3024b4af120949c920` |
 | `docs/AW9_PIXEL_BRIDGE_SPEC.md` | 2298 | 92,038 | `9b8fd5d9806dc2caffeb6ce8bca04ee75f42fdddb089adaba5e5249b04251f6e` |
-| `docs/GEMINI_REVIEW_PACKET.docx` | 270 | 65,021 | `2c4c98b967720db33ae19d254a2bb2878aae5d1e96778ecd4675f2122261eb62` |
-| `docs/GEMINI_REVIEW_PACKET.md` | 3065 | 147,669 | `80b516e32ac2c866a93ccade57c9cb6924c469cfa92b2e494671534126ead3b8` |
+| `docs/GEMINI_REVIEW_PACKET.docx` | 302 | 75,811 | `44477cd8d12f1c74b541f513ffddbb1d8576e77a90b4375ebe9a66a388a67203` |
+| `docs/GEMINI_REVIEW_PACKET.md` | 3095 | 150,170 | `6596817d1bbc2af77dc75c7588c11805ad797f28359a58e1a7d48d6daf013114` |
 | `gradle.properties` | 5 | 136 | `2694880d770a6a050e55e5742f178350e4217d5bbf3a6d40515de7a7911f35f4` |
 | `gradle/wrapper/gradle-wrapper.jar` | 181 | 48,462 | `497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7` |
 | `gradle/wrapper/gradle-wrapper.properties` | 10 | 282 | `ad8aae83783da405b1acb1d39069787f8de5fd64ae5dbf1480f8ced80956c433` |
 | `gradlew` | 249 | 8,656 | `a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59` |
 | `gradlew.bat` | 83 | 2,848 | `d539676c48b596afda64c963ec8f7ee56c7b3fe7e3b81d1dbe2d1a1e3dd9e9f8` |
 | `settings.gradle.kts` | 17 | 334 | `3cf367cad80ac37d5d8e58c1ab965296fa4c71aa5680f025a9e0dd9126b07e6d` |
-| `watchos-companion/WatchBridgeAgent.swift` | 183 | 8,369 | `a4f9a2dccb0a8622ccde62ef918820455924323ebf7a9a7e97e3d1620fcf0fa5` |
+| `watchos-companion/WatchBridgeAgent.swift` | 191 | 8,861 | `92796443d5cf0f445471e4abd6767bd151f8bc9e39d851e12626183a2fb94bf1` |
 
 Commit history:
 
 ```text
+bf43843 docs: refresh review packet to v1.0.1 truth
 68e0624 fix(v1.0.1): hardening patch for D-01..D-14 per adjudication
 da580a3 docs: add self-contained Gemini review packet (markdown + Word)
 ec149ad ci: align provisioned build-tools with compileSdk 36
@@ -3092,3 +3093,74 @@ RSC/Continuity parsers, and `estimateDistanceMeters` boundary handling plus mono
 * **D-12/D-13/D-14 have no unit tests** — they live in `WatchBridgeService`, which requires
   Robolectric or instrumentation to exercise. The logic that *was* extracted to pure functions
   (`isPrivateNetworkAddress`) is likewise not yet covered.
+
+---
+
+## 15. v1.0.2 addendum — the second hardening round
+
+The adjudicator approved the v1.0.0 baseline and mandated v1.0.1. After that, six follow-up decisions were
+put to the reviewer-as-product-owner and all six were approved. This section records that round.
+
+### 15.1 What was approved and shipped
+
+| # | Decision | Shipped |
+|---|---|---|
+| 1 | Verify the Swift on a macOS runner rather than by inspection | New `watchos-companion-typecheck` job on `macos-14` runs `swiftc -typecheck` against the watchOS SDK, plus `swift build --triple arm64-apple-watchos10.0`. A `Package.swift` was added, keeping `watchos-companion/WatchBridgeAgent.swift` at its specified path. |
+| 2 | Extract pure logic **and** add Robolectric | New `BridgePolicy.kt` holds peer gating, continuity acceptance, EMA smoothing, step baseline/window and token comparison. New `BridgePolicyTest` (10 pure tests) and `WatchBridgeServiceTest` (4 Robolectric tests). |
+| 3 | Add a shared token, backwards compatible | `X-Bridge-Token` header or `authToken` JSON field. **Unconfigured bridges keep working** (`BridgePolicy.tokenAccepted` returns true when no token is set). The watch sends it; the IP-header gate from v1.0.1 remains in place. |
+| 4 | Bounded reconnect with backoff | `armConnectTimeout()` closes a handshake that never reports CONNECTED/DISCONNECTED after 15 s, clears the gate, and retries up to `MAX_CONNECT_ATTEMPTS` times with doubling delay. |
+| 5 | D-07, D-07b, D-09 | Millisecond record IDs; real inserted-record counts from `InsertRecordsResponse.recordIdsList`; hour-aligned step windows; `CAMERA_SHUTTER` now reports failure instead of a false success. |
+| 6 | Tag v1.0.2 and refresh the handoff copy | Done at release time. |
+
+### 15.2 Two defects the new tests found in the v1.0.1 code
+
+Writing the token tests immediately caught two real bugs that inspection had missed:
+
+1. **`setAuthToken(context, "")` stored the empty string**, so `loadAuthToken` returned `""` rather than
+   `null`, and the in-memory check disagreed with the persisted one. Fixed by removing the preference when
+   the token is blank.
+2. **`clearAuthToken` did not clear storage** — it nulled the in-memory field only, so the next
+   `loadAuthToken` resurrected a token the user believed they had removed. Fixed by removing the
+   preference.
+
+Both were latent in a security-relevant code path. Neither was visible by reading the code; they were
+found by asserting the persistence round-trip. This is the concrete argument for the Robolectric decision.
+
+### 15.3 Test coverage: 11 -> 25
+
+| Suite | Tests | Covers |
+|---|---|---|
+| `BlePacketParserTest` | 11 | BLE parsing, RMSSD artifact rejection, truncation safety, distance boundaries |
+| `BridgePolicyTest` | 10 | Peer allow/deny incl. `172.15`/`172.32` boundaries and CGNAT, MAC lock + RSSI floor, EMA, step baseline/rollover/absent data, hour alignment, backoff, token comparison |
+| `WatchBridgeServiceTest` | 4 | Token default/persistence/clearing, service start and clean destroy, peer gate via the service facade |
+
+The three D-12/D-13/D-14 behaviours that previously had **no** coverage are now covered in their extracted
+form, and the service lifecycle is exercised on the JVM.
+
+### 15.4 Verification (v1.0.2)
+
+```text
+> .\gradlew.bat testDebugUnitTest lintDebug assembleDebug assembleRelease --parallel --no-daemon
+BUILD SUCCESSFUL
+###GRADLE_EXIT=0
+```
+
+| Gate | Result |
+|---|---|
+| Unit tests | **25 tests, 0 failures, 0 errors** (11 parser + 10 policy + 4 service) |
+| Lint (`abortOnError = true`) | **0 errors, 0 fatal, 12 warnings** (`GradleDependency` x8, `UseKtx` x2, `DataExtractionRules` x1, `OldTargetApi` x1) |
+| `assembleDebug` / `assembleRelease` | versionCode 3, versionName 1.0.2, R8-minified release, signature verified |
+| watchOS type-check | Runs on the macOS runner (see the `watchos-companion-typecheck` job) |
+
+### 15.5 Residual risks after v1.0.2
+
+* **The token is opt-in.** If no token is configured the bridge still accepts any private-LAN peer. Setting
+  one requires typing the same secret on the watch and the phone; there is no pairing flow or key exchange.
+* **`recordIdsList` is annotated `@RestrictTo(LIBRARY_GROUP)`**, so reading it carries a targeted
+  `@SuppressLint("RestrictedApi")`. It is public in 1.1.0 and did not break at runtime, but it is a
+  non-contract API surface that a future Health Connect release could move.
+* **Robolectric cannot exercise real BLE**, so the GATT queue, watchdog and connectGatt gate are covered
+  as extracted policy rather than through a live stack.
+* **`swift build` for watchOS may fail on a macOS runner even when `swiftc -typecheck` passes** (SwiftPM
+  cannot always link a watchOS app target). The type-check is the authoritative gate; the build step is
+  diagnostic.

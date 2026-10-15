@@ -53,8 +53,12 @@ class PixelControlDispatcher(
                 "Decreased Pixel 9 Media Volume"
             }
             "CAMERA_SHUTTER" -> {
-                triggerCameraOrVolumeShutter()
-                "Dispatched Pixel 9 Camera Shutter KeyEvent"
+                val dispatched = triggerCameraOrVolumeShutter()
+                if (dispatched) {
+                    "Dispatched Pixel 9 Camera Shutter KeyEvent"
+                } else {
+                    "Camera shutter dispatch failed (broadcast and key event both rejected)"
+                }
             }
             else -> "Ignored Unknown Command: $command"
         }
@@ -67,14 +71,27 @@ class PixelControlDispatcher(
         audioManager.dispatchMediaKeyEvent(upEvent)
     }
 
-    private fun triggerCameraOrVolumeShutter() {
+    /**
+     * Best-effort shutter dispatch. Returns false when both the broadcast and the
+     * fallback key event failed, so the caller stops reporting a false success (D-09).
+     */
+    private fun triggerCameraOrVolumeShutter(): Boolean {
+        var broadcastOk = false
         try {
             val intent = Intent("com.google.android.camera.action.SHUTTER").apply {
                 addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
             }
             context.sendBroadcast(intent)
+            broadcastOk = true
+        } catch (_: Exception) {
+        }
+        val keyOk = try {
             dispatchMediaKey(KeyEvent.KEYCODE_CAMERA)
-        } catch (_: Exception) {}
+            true
+        } catch (_: Exception) {
+            false
+        }
+        return broadcastOk || keyOk
     }
 
     private fun triggerFindMyPixelAlarm() {

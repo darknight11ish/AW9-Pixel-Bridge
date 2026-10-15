@@ -1,5 +1,6 @@
 package com.bridge.applewatch.health
 
+import android.annotation.SuppressLint
 import android.content.Context
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
@@ -7,6 +8,7 @@ import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.units.*
 import com.bridge.applewatch.model.WebhookTelemetryPayload
+import com.bridge.applewatch.service.BridgePolicy
 import java.time.Instant
 import java.time.ZoneOffset
 
@@ -77,7 +79,7 @@ class HealthConnectManager(context: Context) {
             metadata = Metadata.manualEntry(clientRecordId = "aw9_hr_${start.toEpochMilli()}")
         )
         hc.insertRecords(listOf(record))
-        return sorted.size
+        return 1
     }
 
     suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant = Instant.now()) {
@@ -103,6 +105,10 @@ class HealthConnectManager(context: Context) {
         val windowStart = now.minusSeconds(60)
         val records = mutableListOf<Record>()
 
+        // Millisecond-granular IDs: second-granular IDs collapsed two readings taken
+        // within the same second into one record (D-07).
+        val stamp = now.toEpochMilli()
+
         if (payload.heartRate in 30..240) {
             records.add(
                 HeartRateRecord(
@@ -111,20 +117,30 @@ class HealthConnectManager(context: Context) {
                     endTime = now,
                     endZoneOffset = offset,
                     samples = listOf(HeartRateRecord.Sample(now, payload.heartRate.toLong())),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hr_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hr_$stamp")
                 )
             )
         }
 
         if (stepDelta > 0) {
+            // Steps are interval data. Bucketing into a fixed hourly window keeps
+            // Health Connect aggregation meaningful instead of turning every delta
+            // into a 60-second spike (D-07b).
+            val bucketStart = Instant.ofEpochSecond(
+                BridgePolicy.stepWindowStart(now.epochSecond)
+            )
+            val bucketEnd = bucketStart.plusSeconds(BridgePolicy.STEP_WINDOW_SECONDS)
+            val bucketOffset = ZoneOffset.systemDefault().rules.getOffset(bucketStart)
             records.add(
                 StepsRecord(
-                    startTime = windowStart,
-                    startZoneOffset = offset,
-                    endTime = now,
-                    endZoneOffset = offset,
+                    startTime = bucketStart,
+                    startZoneOffset = bucketOffset,
+                    endTime = bucketEnd,
+                    endZoneOffset = bucketOffset,
                     count = stepDelta,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_steps_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(
+                        clientRecordId = "aw9_steps_${bucketStart.epochSecond}"
+                    )
                 )
             )
         }
@@ -137,7 +153,7 @@ class HealthConnectManager(context: Context) {
                     endTime = now,
                     endZoneOffset = offset,
                     distance = Length.meters(payload.distanceMeters),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_dist_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_dist_$stamp")
                 )
             )
         }
@@ -150,7 +166,7 @@ class HealthConnectManager(context: Context) {
                     endTime = now,
                     endZoneOffset = offset,
                     energy = Energy.kilocalories(payload.activeCalories),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_kcal_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_kcal_$stamp")
                 )
             )
         }
@@ -161,7 +177,7 @@ class HealthConnectManager(context: Context) {
                     time = now,
                     zoneOffset = offset,
                     percentage = Percentage(payload.spo2),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_spo2_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_spo2_$stamp")
                 )
             )
         }
@@ -174,7 +190,7 @@ class HealthConnectManager(context: Context) {
                     endTime = now,
                     endZoneOffset = offset,
                     floors = payload.floorsClimbed,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_floors_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_floors_$stamp")
                 )
             )
         }
@@ -185,7 +201,7 @@ class HealthConnectManager(context: Context) {
                     time = now,
                     zoneOffset = offset,
                     heartRateVariabilityMillis = payload.hrvMs,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hrv_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hrv_$stamp")
                 )
             )
         }
@@ -196,7 +212,7 @@ class HealthConnectManager(context: Context) {
                     time = now,
                     zoneOffset = offset,
                     beatsPerMinute = payload.restingHeartRate.toLong(),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_rhr_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_rhr_$stamp")
                 )
             )
         }
@@ -207,7 +223,7 @@ class HealthConnectManager(context: Context) {
                     time = now,
                     zoneOffset = offset,
                     rate = payload.respiratoryRate,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_resp_${now.epochSecond}")
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_resp_$stamp")
                 )
             )
         }
@@ -227,18 +243,26 @@ class HealthConnectManager(context: Context) {
         }
 
         if (records.isNotEmpty()) {
-            hc.insertRecords(records)
+            return insertAndCount(hc, records)
         }
-        return records.size
+        return 0
     }
+
+    /**
+     * Inserts a batch and returns the number of records Health Connect actually
+     * accepted. A bare `records.size` over-reports when the provider upserts or
+     * deduplicates (D-07).
+     */
+    @SuppressLint("RestrictedApi")
+    private suspend fun insertAndCount(hc: HealthConnectClient, records: List<Record>): Int =
+        if (records.isEmpty()) 0 else hc.insertRecords(records).recordIdsList.size
 
     suspend fun insertBatchRecords(records: List<Record>): Int {
         val hc = client ?: return 0
         if (records.isEmpty()) return 0
         var totalInserted = 0
         records.chunked(500).forEach { chunk ->
-            hc.insertRecords(chunk)
-            totalInserted += chunk.size
+            totalInserted += insertAndCount(hc, chunk)
         }
         return totalInserted
     }
