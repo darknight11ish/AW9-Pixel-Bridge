@@ -1,0 +1,3 @@
+-keep class com.bridge.applewatch.model.** { *; }
+-keep class androidx.health.connect.client.** { *; }
+-dontwarn kotlin.**

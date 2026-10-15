@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">AW9 Pixel Bridge</string>
+    <string name="rationale_title">Health Connect Permissions Rationale</string>
+    <string name="rationale_body">AW9 Pixel Bridge writes live and historical Apple Watch Series 9 biometrics (Heart Rate, HRV RMSSD, Steps, Distance, Active Calories, SpO2, Floors Climbed, Resting Heart Rate, Respiratory Rate, and Sleep) directly to your local Google Health Connect database on your Pixel 9. No data leaves your local network.</string>
+</resources>
