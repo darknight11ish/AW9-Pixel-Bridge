@@ -13,19 +13,27 @@
 | Repository | https://github.com/darknight11ish/AW9-Pixel-Bridge |
 | Visibility | PUBLIC |
 | Default branch | `main` |
-| `main` HEAD (v1.0.2 hardening) | `bf4384304df0342006624ef018fdad91b6b68cfd` |
+| `main` HEAD (v1.0.2) | `517986bcde5a485125d54ff35ecd5a1ecb8bee6f` |
+| v1.0.2 release commit | `517986bcde5a485125d54ff35ecd5a1ecb8bee6f` |
 | v1.0.1 release commit | `68e06240d890411e03068b0856534c371e622255` |
 | v1.0.0 baseline commit | `8f791b438e7d29cfae92993bf40d3a322a7754fe` |
-| Tag objects | `v1.0.1` = `8bab75d487d1e8159f8b447ac714f8d3f1da6c9e`; `v1.0.0` = `6edaf6d7ddb3705e149ad2ceb032fb354a16d2ac` |
-| Releases | [`v1.0.1`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.1) (current, published 2026-10-15T19:34:31Z) and [`v1.0.0`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.0) (baseline, published 2026-10-15T02:38:12Z) |
-| Files committed | 28 |
-| Total committed bytes | 484,496 |
+| Tag objects | `v1.0.2` = `09b43bc424950cfb2f4efbd2286722a8cb463a10`; `v1.0.1` = `8bab75d487d1e8159f8b447ac714f8d3f1da6c9e`; `v1.0.0` = `6edaf6d7ddb3705e149ad2ceb032fb354a16d2ac` |
+| Releases | [`v1.0.2`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.2) (current, published 2026-10-15T21:30:01Z), [`v1.0.1`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.1), and [`v1.0.0`](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/tag/v1.0.0) (baseline) |
+| Files committed | 32 |
+| Total committed bytes | 510,978 |
 | Target platform | Google Pixel 9 (Android 14/15+, API 34-35) ⇄ Apple Watch Series 9 (watchOS 10/11+) |
 | Specification (archived verbatim in repo) | [`docs/AW9_PIXEL_BRIDGE_SPEC.md`](https://github.com/darknight11ish/AW9-Pixel-Bridge/blob/main/docs/AW9_PIXEL_BRIDGE_SPEC.md) (2,063 lines) |
 
 ### 1.1 Downloadable build artifacts (published to GitHub Releases by CI)
 
-**v1.0.1 (current — includes the D-01..D-14 hardening):**
+**v1.0.2 (current — adds the shared token, bounded reconnect, D-07/D-07b/D-09 and 25 tests):**
+
+| Artifact | Size | SHA-256 | Direct link |
+|---|---|---|---|
+| `app-debug.apk` | 27,475,459 B | `bbbb7001a29fc5cdca22bd3c07e307ee5d02d348bb5b318aafdf84d50dae45f3` | https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/download/v1.0.2/app-debug.apk |
+| `app-release.apk` | 2,181,192 B | `c81fc6ba410d5d72f8320eec8a86ce3e0565f05f23021a23bb8fb96ae3253ab6` | https://github.com/darknight11ish/AW9-Pixel-Bridge/releases/download/v1.0.2/app-release.apk |
+
+**v1.0.1 (includes the D-01..D-14 hardening):**
 
 | Artifact | Size | SHA-256 | Direct link |
 |---|---|---|---|
@@ -2960,12 +2968,13 @@ On Windows use `gradlew.bat`; set `JAVA_HOME` to a JDK 17 install first.
 ## 13. Appendix — file inventory with hashes (review anchors)
 
 Use these to confirm you are reviewing the same bytes that were built and shipped.
-This inventory reflects **`main` at v1.0.2** (`bf4384304`).
+This inventory reflects **`main` at v1.0.2** (`517986bcd`).
 
 | Path | Lines | Bytes | SHA-256 |
 |---|---|---|---|
-| `.github/workflows/android-ci.yml` | 98 | 3,229 | `8766fd2773ea8efea0910efccb1f4b7f5bba477af684cab452545ac49f693db8` |
+| `.github/workflows/android-ci.yml` | 105 | 3,849 | `ba72266e2feeee8a10302e3a61694c1a32661c57ad9003c7f753d0912918310f` |
 | `.gitignore` | 15 | 138 | `8af1b5039f29491a6ffbd317a1a94672e807996baea3a6c63878d0df6f214f1a` |
+| `Package.swift` | 30 | 922 | `e6c8665e7bf676b875b95055b31b1e1c8bcb2f2517f902d4321d3c60ada70429` |
 | `README.md` | 35 | 1,845 | `47224ae9b287a4bb8cc3b0950a58ffcb5af7d2e04ad6ab16e91e97ea26c14550` |
 | `app/build.gradle.kts` | 101 | 3,229 | `98b3e2794ae30dc6cbd0480e94f83bdcd6f4ab81243aec8367d51c3786eb8abb` |
 | `app/proguard-rules.pro` | 4 | 123 | `412ff4e76e9aa557f5ceae6cd1d6c19572ab30f8c904c73639d944cb3cd30c79` |
@@ -2977,25 +2986,32 @@ This inventory reflects **`main` at v1.0.2** (`bf4384304`).
 | `app/src/main/java/com/bridge/applewatch/health/AppleHealthXmlImporter.kt` | 143 | 6,089 | `d49d500d48b996c5be35f5defd8a6b8584c864b2ce2f626360d87cc24673a0d4` |
 | `app/src/main/java/com/bridge/applewatch/health/HealthConnectManager.kt` | 270 | 10,708 | `10f8da3a540c4622912417b2c36909f3357ebe0be6e69d1151e92776d834dac5` |
 | `app/src/main/java/com/bridge/applewatch/model/TelemetryModels.kt` | 68 | 2,090 | `05c841e58a832566bda1fb60c9681765231227b7bf13f94922ffc70bb5903d0d` |
+| `app/src/main/java/com/bridge/applewatch/service/BridgePolicy.kt` | 123 | 5,363 | `0323f06f0f4ff38ccf5abacc7a0fd6d051f732063085c574fae51e034eb6564c` |
 | `app/src/main/java/com/bridge/applewatch/service/WatchBridgeService.kt` | 727 | 31,615 | `1d6f60e848d190bc3ff28bfe43753bf37dbec046d16b3699fc8e0d9837b3c0d3` |
 | `app/src/main/res/drawable/ic_watch_bridge.xml` | 10 | 481 | `62c5494a65cd70dab1f879e178eb80b3336299be302ebd4a44ecec226b6426b1` |
 | `app/src/main/res/values/strings.xml` | 6 | 514 | `ca553ad45b595400f31d66f8d2cd24ed0a1206f3785b095328735fd3ebf88898` |
 | `app/src/test/java/com/bridge/applewatch/BlePacketParserTest.kt` | 140 | 5,768 | `ae18e48f2bc2a1c679d4330cab068a73278adc6f5ae7f02a0846f5659bf42395` |
+| `app/src/test/java/com/bridge/applewatch/BridgePolicyTest.kt` | 156 | 7,131 | `d4859b7f170428e16941d8f38499aa97c566e5be1519c4363343901e8a216dc1` |
+| `app/src/test/java/com/bridge/applewatch/WatchBridgeServiceTest.kt` | 96 | 3,676 | `ea1a1f319e82922cc9dd1c61afad13c3fde17b237b756a572000b9356e9e8580` |
 | `build.gradle.kts` | 5 | 142 | `a479fceabfc9d179c20d84e9f928463f659f1ffdcc514a3024b4af120949c920` |
 | `docs/AW9_PIXEL_BRIDGE_SPEC.md` | 2298 | 92,038 | `9b8fd5d9806dc2caffeb6ce8bca04ee75f42fdddb089adaba5e5249b04251f6e` |
-| `docs/GEMINI_REVIEW_PACKET.docx` | 302 | 75,811 | `44477cd8d12f1c74b541f513ffddbb1d8576e77a90b4375ebe9a66a388a67203` |
-| `docs/GEMINI_REVIEW_PACKET.md` | 3095 | 150,170 | `6596817d1bbc2af77dc75c7588c11805ad797f28359a58e1a7d48d6daf013114` |
+| `docs/GEMINI_REVIEW_PACKET.docx` | 298 | 77,897 | `78fccf5fb6992cd3ee569cbb402f5bddf1f2326a32c74e7edc1a0af433279c5b` |
+| `docs/GEMINI_REVIEW_PACKET.md` | 3167 | 154,971 | `118eb25b3d20bd6bff9e9a8ec79f8a35a42da7714e5f8210b71c1092e9bdaa28` |
 | `gradle.properties` | 5 | 136 | `2694880d770a6a050e55e5742f178350e4217d5bbf3a6d40515de7a7911f35f4` |
 | `gradle/wrapper/gradle-wrapper.jar` | 181 | 48,462 | `497c8c2a7e5031f6aa847f88104aa80a93532ec32ee17bdb8d1d2f67a194a9c7` |
 | `gradle/wrapper/gradle-wrapper.properties` | 10 | 282 | `ad8aae83783da405b1acb1d39069787f8de5fd64ae5dbf1480f8ced80956c433` |
 | `gradlew` | 249 | 8,656 | `a5a5c199ba02189ae8c46a334223371a20599d9c298ef65e7540ede4a3f72d59` |
 | `gradlew.bat` | 83 | 2,848 | `d539676c48b596afda64c963ec8f7ee56c7b3fe7e3b81d1dbe2d1a1e3dd9e9f8` |
 | `settings.gradle.kts` | 17 | 334 | `3cf367cad80ac37d5d8e58c1ab965296fa4c71aa5680f025a9e0dd9126b07e6d` |
-| `watchos-companion/WatchBridgeAgent.swift` | 191 | 8,861 | `92796443d5cf0f445471e4abd6767bd151f8bc9e39d851e12626183a2fb94bf1` |
+| `watchos-companion/WatchBridgeAgent.swift` | 211 | 9,917 | `871ad64814267f1cf2623de16935240be440ed7c1c49dedcbbbbc3ffb0070290` |
 
 Commit history:
 
 ```text
+517986b ci(watchos): drop the redundant second type-check
+3f112c9 ci(watchos): make the Swift gate honest and meaningful
+a02dc9a fix(watchos): use only transports watchOS actually supports
+552be8a feat(v1.0.2): shared token, bounded reconnect, D-07/D-07b/D-09, 25 tests
 bf43843 docs: refresh review packet to v1.0.1 truth
 68e0624 fix(v1.0.1): hardening patch for D-01..D-14 per adjudication
 da580a3 docs: add self-contained Gemini review packet (markdown + Word)
