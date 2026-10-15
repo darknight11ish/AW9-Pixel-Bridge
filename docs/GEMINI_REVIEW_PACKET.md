@@ -3168,6 +3168,47 @@ BUILD SUCCESSFUL
 | `assembleDebug` / `assembleRelease` | versionCode 3, versionName 1.0.2, R8-minified release, signature verified |
 | watchOS type-check | Runs on the macOS runner (see the `watchos-companion-typecheck` job) |
 
+### 15.6 The v1.0.2 type-check found a specification defect
+
+The macOS type-check failed on its first run, and that failure is the most consequential finding of this
+round:
+
+```text
+watchos-companion/WatchBridgeAgent.swift:38:29: error: 'init(delegate:queue:)' is unavailable in watchOS
+watchos-companion/WatchBridgeAgent.swift:78:28: error: 'init(type:properties:value:permissions:)' is unavailable in watchOS
+watchos-companion/WatchBridgeAgent.swift:84:23: error: 'init(type:primary:)' is unavailable in watchOS
+watchos-companion/WatchBridgeAgent.swift:6:1:  error: 'main' attribute cannot be used in a module that contains top-level code
+```
+
+**watchOS does not expose the CoreBluetooth peripheral role.** `CBPeripheralManager`, `CBMutableService`
+and `CBMutableCharacteristic` are all marked unavailable for watchOS, so the companion can never advertise
+the standard Heart Rate service (`0x180D` / `0x2A37`) that specification section 4.1 describes. The
+previous revision of that file could not have built for watchOS at all — and no amount of reading the
+source would have revealed it, because the code is legal Swift on every other Apple platform.
+
+This is a **specification defect**, and it is the clearest justification for the macOS job that was
+approved: the spec's watch-side BLE design was impossible from the start.
+
+What v1.0.2 changed as a result:
+
+* **CoreBluetooth removed from the companion entirely** — no `CBPeripheralManager` delegate, no mutable
+  service or characteristic, no advertisement. Biometrics travel only over the HealthKit → HTTP webhook
+  path on `:8484`, which is the path the Android side already ingests. The transport limitation is now
+  documented in the type's doc comment so it cannot be silently reintroduced.
+* A real `HKQuantityTypeIdentifier.heartRateVariabilitySDNN` case was added; the authorization request
+  already asked for it but nothing ever read it.
+* Push responses are inspected and surfaced in the UI (`Synced` / bad bridge token / peer not on the local
+  network). Previously a failure was invisible, so a mis-typed token would have looked like a working bridge.
+* `workoutSession(didChangeTo:)` and `didFailWithError` now clear `isStreaming` instead of leaving
+  "Streaming Active" latched after the session ends or fails.
+* The type-check passes `-parse-as-library`, matching how Xcode compiles an app target; without it `swiftc`
+  treats the file as a script and rejects `@main`.
+
+**Consequence for the Android side, recorded honestly.** The BLE GATT client still works against standard
+third-party Heart Rate peripherals, but it **cannot pair with this watch's HR service**, because watchOS
+will not serve one. The Apple Watch data path is HealthKit + HTTP; the passive `0x004C` Continuity sniffer is
+unaffected.
+
 ### 15.5 Residual risks after v1.0.2
 
 * **The token is opt-in.** If no token is configured the bridge still accepts any private-LAN peer. Setting
