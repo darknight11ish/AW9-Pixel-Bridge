@@ -19,12 +19,15 @@ import com.bridge.applewatch.model.WebhookTelemetryPayload
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.net.ServerSocket
 import java.time.Instant
+import java.time.LocalDate
 import java.time.LocalTime
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -58,6 +61,28 @@ class WatchBridgeService : Service() {
 
         private const val PREFS_NAME = "aw9_bridge_prefs"
         private const val PREF_AUTH_TOKEN = "auth_token"
+
+        /** Separate store for the step baseline, so clearing auth cannot drop it. */
+        private const val STEP_PREFS_NAME = "aw9_step_baseline"
+        private const val PREF_STEP_EPOCH_DAY = "savedEpochDay"
+        private const val PREF_STEP_COUNT = "savedSteps"
+
+        /** Honest placeholder used when a peripheral never told us its name (OPEN-02). */
+        const val UNKNOWN_SENSOR_NAME = "BLE Biometric Sensor"
+
+        /**
+         * Max concurrent HTTP handlers. Each connection costs a coroutine plus a
+         * socket, so this is the cap that stops a flood of silent peers from
+         * exhausting the service (OPEN-03).
+         */
+        private const val HTTP_MAX_CONCURRENCY = 8
+
+        /** Read timeout for a connected HTTP client, so a half-open peer cannot hang us. */
+        private const val HTTP_READ_TIMEOUT_MS = 5_000
+
+        /** Advertised on every response, including 401/403, so browsers can send the token. */
+        private const val CORS_ALLOW_HEADERS =
+            "Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, Authorization"
 
         /** Optional shared secret. Empty means the bridge accepts any private peer. */
         @Volatile
@@ -99,6 +124,41 @@ class WatchBridgeService : Service() {
                 .apply()
         }
 
+        /**
+         * Restores the step baseline persisted by a previous run (OPEN-04).
+         *
+         * The cumulative step counter is monotonic *within a day*, so a stored value is
+         * only reusable while its epoch-day matches today. Across midnight the counter
+         * restarts (and the watch may report a fresh day's total), so a stale baseline
+         * would either emit a bogus negative delta or silently swallow the new day's
+         * steps. Returning [BridgePolicy.NO_STEP_BASELINE] makes the first reading of
+         * the new day re-establish the baseline instead.
+         */
+        fun loadPersistedStepBaseline(context: Context, todayEpochDay: Long): Long {
+            val prefs = context.getSharedPreferences(STEP_PREFS_NAME, Context.MODE_PRIVATE)
+            val savedEpochDay = prefs.getLong(PREF_STEP_EPOCH_DAY, Long.MIN_VALUE)
+            if (savedEpochDay != todayEpochDay) return BridgePolicy.NO_STEP_BASELINE
+            return prefs.getLong(PREF_STEP_COUNT, BridgePolicy.NO_STEP_BASELINE)
+        }
+
+        /** Persists the baseline against today's epoch-day so a restart can reuse it. */
+        fun persistStepBaseline(context: Context, steps: Long, todayEpochDay: Long) {
+            if (steps == BridgePolicy.NO_STEP_BASELINE) return
+            context.getSharedPreferences(STEP_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(PREF_STEP_EPOCH_DAY, todayEpochDay)
+                .putLong(PREF_STEP_COUNT, steps)
+                .apply()
+        }
+
+        /** Test-only: drops the persisted baseline so tests start from a known state. */
+        fun clearPersistedStepBaseline(context: Context) {
+            context.getSharedPreferences(STEP_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .clear()
+                .apply()
+        }
+
         /** True only for loopback and RFC1918 peers. */
         fun isPrivateNetworkAddress(host: String?): Boolean =
             BridgePolicy.isPrivateNetworkAddress(host)
@@ -122,6 +182,9 @@ class WatchBridgeService : Service() {
     private var bleScanner: BluetoothLeScanner? = null
     private var activeGatt: BluetoothGatt? = null
     private var serverSocket: ServerSocket? = null
+
+    /** Bounds concurrent /telemetry handlers so a silent client cannot pin resources. */
+    private val httpSemaphore = Semaphore(HTTP_MAX_CONCURRENCY)
 
     private val gattOperationQueue = ConcurrentLinkedQueue<Runnable>()
     @Volatile private var isGattOperationInProgress = false
@@ -163,6 +226,10 @@ class WatchBridgeService : Service() {
         super.onCreate()
         shuttingDownForTest = false
         loadAuthToken(this)
+        // Reuse today's baseline so a service restart does not treat the watch's
+        // cumulative counter as brand-new and dump a whole day into one window
+        // (OPEN-04).
+        lastCumulativeSteps = loadPersistedStepBaseline(this, LocalDate.now().toEpochDay())
         healthManager = HealthConnectManager(this)
         controlDispatcher = PixelControlDispatcher(this, serviceScope)
 
@@ -242,9 +309,12 @@ class WatchBridgeService : Service() {
 
             val uuids = record.serviceUuids?.map { it.uuid } ?: emptyList()
             val devName = result.device.name ?: ""
+            // Connect only when the advertisement really exposes a service we can
+            // consume. Matching on the device *name* used to connect to every
+            // "Apple Watch" in range (OPEN-01/OPEN-02): the watch cannot serve
+            // 0x180D, so that produced a "connected" UI with zero data.
             val matchesBridge =
-                uuids.contains(HRS_SERVICE_UUID) || uuids.contains(RSC_SERVICE_UUID) ||
-                    devName.contains("Apple Watch", ignoreCase = true)
+                uuids.contains(HRS_SERVICE_UUID) || uuids.contains(RSC_SERVICE_UUID)
             if (matchesBridge) {
                 if (deviceAddress.isNotBlank()) trackedWatchAddress = deviceAddress
                 lastConnectCandidate = result.device
@@ -257,8 +327,10 @@ class WatchBridgeService : Service() {
 
     private fun beginGattConnection(device: BluetoothDevice, devName: String, deviceAddress: String) {
         isBleConnecting = true
+        // The name is provisional until onServicesDiscovered proves the device is
+        // usable, so record only what the stack actually reported.
         _telemetry.value = _telemetry.value.copy(
-            watchName = devName.ifEmpty { "Apple Watch Series 9" },
+            watchName = devName.ifBlank { UNKNOWN_SENSOR_NAME },
             watchMacAddress = deviceAddress
         )
         try {
@@ -302,7 +374,7 @@ class WatchBridgeService : Service() {
     }
 
     private fun scheduleConnectRetry() {
-        val candidate = lastConnectCandidate ?: return
+        if (lastConnectCandidate == null) return
         if (connectAttempts >= BridgePolicy.MAX_CONNECT_ATTEMPTS) {
             logEvent("GATT reconnect budget exhausted — waiting for a fresh advertisement")
             connectAttempts = 0
@@ -317,7 +389,7 @@ class WatchBridgeService : Service() {
                 return@launch
             }
             val device = lastConnectCandidate ?: return@launch
-            beginGattConnection(device, device.name ?: "Apple Watch Series 9", device.address)
+            beginGattConnection(device, device.name ?: UNKNOWN_SENSOR_NAME, device.address)
         }
     }
 
@@ -367,13 +439,15 @@ class WatchBridgeService : Service() {
                 cancelConnectTimeout()
                 isBleConnecting = false
                 connectAttempts = 0
-                _telemetry.value = _telemetry.value.copy(
-                    isBleConnected = true,
-                    watchName = gatt.device.name ?: "Apple Watch Series 9",
-                    watchMacAddress = gatt.device.address
-                )
                 trackedWatchAddress = gatt.device.address
-                logEvent("BLE GATT Connected to ${gatt.device.address}")
+                // A GATT link is NOT a usable biometric link (OPEN-01). Claiming
+                // "connected" here was the actively deceptive state described in
+                // the engagement report: the link succeeds, then no service is
+                // found and no data ever arrives.
+                logEvent(
+                    "BLE link established with ${gatt.device.address} — " +
+                        "verifying 0x180D/0x1814 services..."
+                )
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 cancelConnectTimeout()
@@ -393,12 +467,42 @@ class WatchBridgeService : Service() {
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status != BluetoothGatt.GATT_SUCCESS) return
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                logEvent("Service discovery failed with status $status — disconnecting")
+                abandonGattLink(gatt)
+                return
+            }
 
-            gatt.getService(HRS_SERVICE_UUID)?.getCharacteristic(HR_MEASUREMENT_CHAR_UUID)?.let { char ->
+            val hasHr = gatt.getService(HRS_SERVICE_UUID)
+                ?.getCharacteristic(HR_MEASUREMENT_CHAR_UUID) != null
+            val hasRsc = gatt.getService(RSC_SERVICE_UUID)
+                ?.getCharacteristic(RSC_MEASUREMENT_CHAR_UUID) != null
+
+            if (!hasHr && !hasRsc) {
+                logEvent(
+                    "BLE device ${gatt.device.address} has no 0x180D/0x1814 service — disconnecting"
+                )
+                abandonGattLink(gatt)
+                return
+            }
+
+            // Only now is the link provably useful, so this is where "connected" is
+            // earned. Never guess a product name (OPEN-02).
+            _telemetry.value = _telemetry.value.copy(
+                isBleConnected = true,
+                watchName = gatt.device.name?.takeIf { it.isNotBlank() } ?: UNKNOWN_SENSOR_NAME,
+                watchMacAddress = gatt.device.address
+            )
+            logEvent(
+                "BLE GATT Connected to ${gatt.device.address} " +
+                    "(0x180D=${if (hasHr) "yes" else "no"}, 0x1814=${if (hasRsc) "yes" else "no"})"
+            )
+
+            val hrChar = gatt.getService(HRS_SERVICE_UUID)?.getCharacteristic(HR_MEASUREMENT_CHAR_UUID)
+            if (hrChar != null) {
                 enqueueGattOperation(Runnable {
-                    gatt.setCharacteristicNotification(char, true)
-                    val desc = char.getDescriptor(CCCD_UUID)
+                    gatt.setCharacteristicNotification(hrChar, true)
+                    val desc = hrChar.getDescriptor(CCCD_UUID)
                     if (desc == null) {
                         executeNextGattOperation()
                     } else if (gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
@@ -410,10 +514,12 @@ class WatchBridgeService : Service() {
                 })
             }
 
-            gatt.getService(RSC_SERVICE_UUID)?.getCharacteristic(RSC_MEASUREMENT_CHAR_UUID)?.let { char ->
+            val rscChar =
+                gatt.getService(RSC_SERVICE_UUID)?.getCharacteristic(RSC_MEASUREMENT_CHAR_UUID)
+            if (rscChar != null) {
                 enqueueGattOperation(Runnable {
-                    gatt.setCharacteristicNotification(char, true)
-                    val desc = char.getDescriptor(CCCD_UUID)
+                    gatt.setCharacteristicNotification(rscChar, true)
+                    val desc = rscChar.getDescriptor(CCCD_UUID)
                     if (desc == null) {
                         executeNextGattOperation()
                     } else if (gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
@@ -470,6 +576,32 @@ class WatchBridgeService : Service() {
         }
     }
 
+    /**
+     * Tears down a GATT link that turned out not to expose a service we can consume.
+     * [isBleConnected] is deliberately left false, and the queue is cleared so no
+     * operation is left waiting on a closed client.
+     */
+    private fun abandonGattLink(gatt: BluetoothGatt) {
+        isGattOperationInProgress = false
+        gattOperationQueue.clear()
+        gattWatchdogJob?.cancel()
+        gattWatchdogJob = null
+        _telemetry.value = _telemetry.value.copy(
+            isBleConnected = false,
+            sensorContactOnWrist = false
+        )
+        try {
+            gatt.disconnect()
+            gatt.close()
+        } catch (e: Exception) {
+            logEvent("GATT teardown error: ${e.message}")
+        }
+        if (activeGatt === gatt) activeGatt = null
+        // Bounded retry: reconnecting forever to a device that will never expose
+        // 0x180D is exactly the loop this change exists to stop.
+        if (!isShuttingDown) scheduleConnectRetry()
+    }
+
     private fun handleCharacteristicPayload(uuid: UUID, bytes: ByteArray) {
         when (uuid) {
             HR_MEASUREMENT_CHAR_UUID -> {
@@ -517,7 +649,10 @@ class WatchBridgeService : Service() {
                 serverSocket = ServerSocket(port)
                 while (isActive) {
                     val client = serverSocket?.accept() ?: break
-                    launch { handleHttpConnection(client) }
+                    // Bounded concurrency: an unbounded `launch` per connection let a
+                    // handful of silent or malicious peers pin unlimited coroutines
+                    // and sockets (OPEN-03).
+                    launch { httpSemaphore.withPermit { handleHttpConnection(client) } }
                 }
             } catch (e: Exception) {
                 if (!isShuttingDown) {
@@ -528,81 +663,113 @@ class WatchBridgeService : Service() {
     }
 
     private suspend fun handleHttpConnection(socket: java.net.Socket) {
-        socket.use { client ->
-            val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-            val writer = PrintWriter(client.getOutputStream(), true)
+        try {
+            socket.use { client ->
+                // A silent or half-open peer must not hold a permit forever.
+                client.soTimeout = HTTP_READ_TIMEOUT_MS
+                val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                val writer = PrintWriter(client.getOutputStream(), true)
 
-            // Only loopback / private LAN peers may drive the bridge.
-            val remoteHost = client.inetAddress?.hostAddress
-            if (!BridgePolicy.isPrivateNetworkAddress(remoteHost)) {
-                logEvent("HTTP connection refused from non-private peer $remoteHost")
-                writeResponse(writer, 403, "Forbidden", """{"status":"forbidden","code":403}""")
-                return
-            }
+                val requestLine = reader.readLine() ?: return
+                val parts = requestLine.split(" ")
+                val method = parts.getOrNull(0) ?: "GET"
+                val path = parts.getOrNull(1) ?: "/"
 
-            val requestLine = reader.readLine() ?: return
-            val parts = requestLine.split(" ")
-            val method = parts.getOrNull(0) ?: "GET"
-            val path = parts.getOrNull(1) ?: "/"
-
-            var contentLength = 0
-            var presentedToken: String? = null
-            var line = reader.readLine()
-            while (!line.isNullOrEmpty()) {
-                when {
-                    line.startsWith("Content-Length:", ignoreCase = true) ->
-                        contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
-                    line.startsWith("X-Bridge-Token:", ignoreCase = true) ->
-                        presentedToken = line.substringAfter(":").trim()
+                // CORS preflight first: browsers never send credentials on OPTIONS,
+                // so it can neither be authenticated nor originate from a private
+                // address exclusively.
+                if (method.equals("OPTIONS", ignoreCase = true)) {
+                    writeCorsPreflight(writer)
+                    return
                 }
-                line = reader.readLine()
-            }
 
-            val body = if (contentLength > 0) {
-                val buf = CharArray(contentLength)
-                var totalRead = 0
-                while (totalRead < contentLength) {
-                    val r = reader.read(buf, totalRead, contentLength - totalRead)
-                    if (r == -1) break
-                    totalRead += r
+                // Only loopback / private LAN peers may drive the bridge.
+                val remoteHost = client.inetAddress?.hostAddress
+                if (!BridgePolicy.isPrivateNetworkAddress(remoteHost)) {
+                    logEvent("HTTP connection refused from non-private peer $remoteHost")
+                    writeResponse(writer, 403, "Forbidden", """{"status":"forbidden","code":403}""")
+                    return
                 }
-                String(buf, 0, totalRead)
-            } else ""
 
-            // A JSON body may also carry the token, for clients that cannot set headers.
-            if (presentedToken.isNullOrBlank() && body.isNotBlank()) {
-                presentedToken = runCatching {
-                    JSONObject(body).optString("authToken", "")
-                }.getOrDefault("")
-            }
-
-            if (!BridgePolicy.tokenAccepted(authToken, presentedToken)) {
-                logEvent("HTTP request rejected: bridge token mismatch")
-                writeResponse(writer, 401, "Unauthorized", """{"status":"unauthorized","code":401}""")
-                return
-            }
-
-            val responseJson = when {
-                method == "GET" && path.startsWith("/status") -> {
-                    val s = _telemetry.value
-                    """{"status":"online","bleConnected":${s.isBleConnected},"bpm":${s.heartRateBpm},"hcSynced":${s.healthConnectSyncedCount}}"""
+                var contentLength = 0
+                var presentedToken: String? = null
+                var line = reader.readLine()
+                while (!line.isNullOrEmpty()) {
+                    when {
+                        line.startsWith("Content-Length:", ignoreCase = true) ->
+                            contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+                        line.startsWith("X-Bridge-Token:", ignoreCase = true) ->
+                            presentedToken = line.substringAfter(":").trim()
+                    }
+                    line = reader.readLine()
                 }
-                method == "POST" && path.startsWith("/control") -> {
-                    val json = JSONObject(body.ifEmpty { "{}" })
-                    val cmd = json.optString("command", "")
-                    val outcome = controlDispatcher.executeCommand(cmd)
-                    _telemetry.value = _telemetry.value.copy(lastControlAction = outcome)
-                    logEvent("Watch Control → $outcome")
-                    """{"status":"executed","action":"$outcome"}"""
-                }
-                else -> {
-                    processWebhookTelemetryJson(body)
-                    """{"status":"synced","hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
-                }
-            }
 
-            writeResponse(writer, 200, "OK", responseJson)
+                val body = if (contentLength > 0) {
+                    val buf = CharArray(contentLength)
+                    var totalRead = 0
+                    while (totalRead < contentLength) {
+                        val r = reader.read(buf, totalRead, contentLength - totalRead)
+                        if (r == -1) break
+                        totalRead += r
+                    }
+                    String(buf, 0, totalRead)
+                } else ""
+
+                // A JSON body may also carry the token, for clients that cannot set headers.
+                if (presentedToken.isNullOrBlank() && body.isNotBlank()) {
+                    presentedToken = runCatching {
+                        JSONObject(body).optString("authToken", "")
+                    }.getOrDefault("")
+                }
+
+                if (!BridgePolicy.tokenAccepted(authToken, presentedToken)) {
+                    logEvent("HTTP request rejected: bridge token mismatch")
+                    writeResponse(writer, 401, "Unauthorized", """{"status":"unauthorized","code":401}""")
+                    return
+                }
+
+                val responseJson = when {
+                    method == "GET" && path.startsWith("/status") -> {
+                        val s = _telemetry.value
+                        """{"status":"online","bleConnected":${s.isBleConnected},"bpm":${s.heartRateBpm},"hcSynced":${s.healthConnectSyncedCount}}"""
+                    }
+                    method == "POST" && path.startsWith("/control") -> {
+                        val json = JSONObject(body.ifEmpty { "{}" })
+                        val cmd = json.optString("command", "")
+                        val outcome = controlDispatcher.executeCommand(cmd)
+                        _telemetry.value = _telemetry.value.copy(lastControlAction = outcome)
+                        logEvent("Watch Control → $outcome")
+                        """{"status":"executed","action":"$outcome"}"""
+                    }
+                    else -> {
+                        processWebhookTelemetryJson(body)
+                        """{"status":"synced","hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+                    }
+                }
+
+                writeResponse(writer, 200, "OK", responseJson)
+            }
+        } catch (e: Exception) {
+            // A malformed request, a socket timeout or a peer that vanished mid-body
+            // used to propagate out of the launched coroutine and leave no response
+            // at all (OPEN-03).
+            if (!isShuttingDown) {
+                logEvent("HTTP Client Error (${e.javaClass.simpleName}): ${e.message}")
+            }
         }
+    }
+
+    /** Answers a CORS preflight without touching auth or the private-peer gate. */
+    private fun writeCorsPreflight(writer: PrintWriter) {
+        writer.print(
+            "HTTP/1.1 204 No Content\r\n" +
+                "Access-Control-Allow-Origin: *\r\n" +
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                "$CORS_ALLOW_HEADERS\r\n" +
+                "Access-Control-Max-Age: 86400\r\n" +
+                "Connection: close\r\n\r\n"
+        )
+        writer.flush()
     }
 
     private fun writeResponse(writer: PrintWriter, code: Int, reason: String, json: String) {
@@ -610,7 +777,8 @@ class WatchBridgeService : Service() {
             "HTTP/1.1 $code $reason\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +
-                "Access-Control-Allow-Headers: Content-Type, X-Bridge-Token\r\n" +
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                "$CORS_ALLOW_HEADERS\r\n" +
                 "Content-Length: ${json.toByteArray().size}\r\n" +
                 "Connection: close\r\n\r\n" +
                 json
@@ -655,6 +823,7 @@ class WatchBridgeService : Service() {
                 logEvent("Step baseline established at ${advance.baseline}")
             }
             lastCumulativeSteps = advance.baseline
+            persistStepBaseline(this, advance.baseline, LocalDate.now().toEpochDay())
 
             val writtenCount = healthManager.writeTelemetryPayload(payload, advance.delta)
 
