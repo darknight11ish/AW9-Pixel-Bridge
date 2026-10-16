@@ -119,7 +119,14 @@ The watchOS companion is a real app source tree with a spec, but it is **not
 installable until you generate and sign it on a Mac**:
 
 ```bash
-brew install xcodegen          # NOT pre-installed on GitHub's macOS runner images
+# XcodeGen 2.43.0 specifically: 2.44+ writes the Xcode 16 project format, which
+# Xcode 15 refuses to open ("future Xcode project file format (77)"). Skip the
+# version pin only if you are on Xcode 16 or newer.
+curl -fsSL -o /tmp/xcodegen.zip \
+  https://github.com/yonaskolb/XcodeGen/releases/download/2.43.0/xcodegen.zip
+unzip -q /tmp/xcodegen.zip -d /tmp/xcodegen && export PATH="/tmp/xcodegen:$PATH"
+
+# Not pre-installed on GitHub's macOS runner images either; see .github/workflows.
 cd watchos-companion
 xcodegen generate              # produces WatchBridgeAgent.xcodeproj from project.yml
 open WatchBridgeAgent.xcodeproj
