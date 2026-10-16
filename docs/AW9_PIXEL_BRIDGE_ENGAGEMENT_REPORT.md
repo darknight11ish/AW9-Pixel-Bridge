@@ -39,6 +39,7 @@ Three releases were shipped, all built and verified by CI:
 | v1.0.1 | Hardening: defects D-01…D-14 | 28 | 507,064 | 11 | 0 errors / 8 warnings |
 | v1.0.2 | Token, bounded reconnect, D-07/D-07b/D-09, watchOS CI | 32 | 510,151 | 25 | 0 errors / 12 warnings |
 | v1.1.0 | Closure of all ten open items (OPEN-01…OPEN-10) | 41 | 732,814 | 58 | 0 errors / 14 warnings |
+| v1.2.0 | Four hardening PRs, PRs opened and CI-verified before merge | 44 | 1,056,310 | 84 | 0 errors / 14 warnings |
 
 > The v1.0.0 and v1.0.1 byte totals in this table are the originally published ones; the
 > measured values differ (238,044 and 464,707) — see §12.3 for the reconciliation.
