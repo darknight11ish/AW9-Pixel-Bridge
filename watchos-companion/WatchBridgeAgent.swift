@@ -96,16 +96,23 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     /// Neither is produced by `HKLiveWorkoutDataSource` — they are periodic values the
     /// system computes — so each is fetched with a single-sample `HKSampleQuery`
     /// sorted newest-first. Both lookups are dispatched together and the resulting
-    /// payload is pushed once, so a partially-populated POST cannot be mistaken for a
-    /// reading that does not exist.
+    /// payload is pushed **once**, so a partially-populated POST cannot be mistaken for
+    /// a reading that does not exist.
+    ///
+    /// If neither type yields a sample there is nothing new to send, so nothing is sent
+    /// and the reason is surfaced in the UI. The defaults (`restingHr = 0`,
+    /// `respiratoryRate = -1.0`) are exactly the sentinels the Android side's range
+    /// checks skip, so even a pushed payload cannot fabricate a record.
     func pollBackgroundVitals() {
         let group = DispatchGroup()
         var latestRestingHr = 0
         var latestRespiratory = -1.0
+        var queryFailures = 0
 
         if let restingType = HKObjectType.quantityType(forIdentifier: .restingHeartRate) {
             group.enter()
-            latestSample(of: restingType) { sample in
+            latestSample(of: restingType) { sample, failed in
+                if failed { queryFailures += 1 }
                 if let sample = sample {
                     let bpmUnit = HKUnit.count().unitDivided(by: .minute())
                     latestRestingHr = Int(sample.quantity.doubleValue(for: bpmUnit).rounded())
@@ -116,7 +123,8 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
 
         if let respiratoryType = HKObjectType.quantityType(forIdentifier: .respiratoryRate) {
             group.enter()
-            latestSample(of: respiratoryType) { sample in
+            latestSample(of: respiratoryType) { sample, failed in
+                if failed { queryFailures += 1 }
                 if let sample = sample {
                     let breathUnit = HKUnit.count().unitDivided(by: .minute())
                     latestRespiratory = sample.quantity.doubleValue(for: breathUnit)
@@ -128,19 +136,42 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
         group.notify(queue: .main) {
             if latestRestingHr > 0 { self.restingHr = latestRestingHr }
             if latestRespiratory > 0 { self.respiratoryRate = latestRespiratory }
+
+            if queryFailures > 0 {
+                // A denied permission or a failed query is not an empty reading; saying
+                // so is the difference between "no data yet" and "you never authorised
+                // this", which the user cannot otherwise distinguish.
+                self.lastPushStatus = "HealthKit query failed (\(queryFailures))"
+                return
+            }
+
+            guard latestRestingHr > 0 || latestRespiratory > 0 else {
+                self.lastPushStatus = "No resting HR / respiratory data yet"
+                return
+            }
+
             self.postTelemetryToPixel(controlCommand: "")
         }
     }
 
-    /// Newest-first, limit-1 sample lookup. Completion is always invoked exactly once so
-    /// the caller's dispatch group cannot deadlock on an error path.
-    private func latestSample(of type: HKQuantityType, completion: @escaping (HKQuantitySample?) -> Void) {
+    /// Newest-first, limit-1 sample lookup.
+    ///
+    /// `completion` is always invoked exactly once so the caller's dispatch group cannot
+    /// deadlock on an error path. `failed` distinguishes "the query could not run" (a
+    /// permission or HealthKit problem worth reporting) from "the query ran and there is
+    /// no sample", which is a normal state for a metric the watch has not recorded yet.
+    private func latestSample(
+        of type: HKQuantityType,
+        completion: @escaping (HKQuantitySample?, Bool) -> Void
+    ) {
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         let query = HKSampleQuery(sampleType: type, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, error in
             if let error = error {
                 print("\(type.identifier) query failed: \(error)")
+                completion(nil, true)
+                return
             }
-            completion(samples?.first as? HKQuantitySample)
+            completion(samples?.first as? HKQuantitySample, false)
         }
         healthStore.execute(query)
     }
@@ -260,7 +291,7 @@ struct WatchBridgeView: View {
                 Text("\(streamer.liveBpm) BPM")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.red)
-                Text("Resting \(streamer.restingHr) BPM · Resp \(String(format: "%.1f", streamer.respiratoryRate)) brpm")
+                Text("Resting \(restingHrLabel(streamer.restingHr)) · Resp \(respiratoryLabel(streamer.respiratoryRate))")
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                 Text(streamer.lastPushStatus)
@@ -283,5 +314,18 @@ struct WatchBridgeView: View {
                 }.tint(.blue)
             }
         }
+    }
+
+    /// Renders the sentinel as "none yet" instead of as a clinical-looking 0 BPM.
+    ///
+    /// These two values are not continuously available on watchOS — they are periodic
+    /// HealthKit readings — so the watch commonly has no sample at all. Showing "0"
+    /// would read as a measurement of zero rather than as an absence.
+    private func restingHrLabel(_ value: Int) -> String {
+        value > 0 ? "\(value) BPM" : "none yet"
+    }
+
+    private func respiratoryLabel(_ value: Double) -> String {
+        value > 0 ? String(format: "%.1f brpm", value) : "none yet"
     }
 }
