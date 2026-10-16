@@ -58,10 +58,24 @@ data class WebhookTelemetryPayload(
     val activeCalories: Double = -1.0,
     val spo2: Double = -1.0,
     val floorsClimbed: Double = -1.0,
+    /**
+     * RMSSD in milliseconds, or -1.0 for "no reading".
+     *
+     * Apple's HealthKit HRV is **SDNN**, which is not interchangeable with RMSSD, so
+     * SDNN-named producers must not populate this field (D-05).
+     */
     val hrvMs: Double = -1.0,
     val restingHeartRate: Int = 0,
     val respiratoryRate: Double = -1.0,
     val sleepMinutes: Long = -1L,
+    /**
+     * Sleep duration in hours, converted to minutes before use.
+     *
+     * Kept separate from [sleepMinutes] because Health Auto Export reports
+     * `sleep_analysis` durations in **hours**; parsing those into the minutes field
+     * produced a 7.5-hour night as a 7-minute session.
+     */
+    val sleepHours: Double = -1.0,
     val battery: Int = -1,
     val controlCommand: String = ""
 )

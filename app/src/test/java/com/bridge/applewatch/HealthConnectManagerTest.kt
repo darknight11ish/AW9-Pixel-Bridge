@@ -9,6 +9,7 @@ import androidx.health.connect.client.records.HeartRateRecord
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.records.OxygenSaturationRecord
 import androidx.health.connect.client.records.Record
+import androidx.health.connect.client.records.RespiratoryRateRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.records.SleepSessionRecord
 import androidx.health.connect.client.records.StepsRecord
@@ -18,6 +19,8 @@ import androidx.health.connect.client.units.Length
 import androidx.health.connect.client.units.Percentage
 import androidx.test.core.app.ApplicationProvider
 import com.bridge.applewatch.health.HealthConnectManager
+import com.bridge.applewatch.model.WebhookTelemetryPayload
+import com.bridge.applewatch.service.BridgePolicy
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -270,5 +273,310 @@ class HealthConnectManagerTest {
             HealthConnectManager(context).splitIntoBatches(records, chunkSize = 4)
                 .sumOf { it.size }
         )
+    }
+
+    // ------------------------------------------------------- write gates (TW-1/TW-7)
+
+    /**
+     * The ten guards in `buildTelemetryRecords` are the last line between a sentinel
+     * value and a fabricated clinical record. They used to be reachable only through a
+     * live Health Connect client, which a JVM test cannot construct — so deleting every
+     * one of them left the suite green. These tests pin each boundary.
+     */
+    @Test
+    fun `the default payload writes nothing at all`() {
+        val records = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = 0L, now = now)
+
+        assertEquals("an all-sentinel payload must produce no records", 0, records.size)
+    }
+
+    @Test
+    fun `heart rate is gated to the 30 to 240 range`() {
+        fun records(bpm: Int) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(heartRate = bpm), 0L, now)
+            .filterIsInstance<HeartRateRecord>()
+
+        assertEquals("0 is the 'no reading' sentinel", 0, records(0).size)
+        assertEquals(0, records(29).size)
+        assertEquals(1, records(30).size)
+        assertEquals(1, records(240).size)
+        assertEquals(0, records(241).size)
+    }
+
+    @Test
+    fun `spo2 is gated to the 70 to 100 range inclusively`() {
+        fun records(spo2: Double) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(spo2 = spo2), 0L, now)
+            .filterIsInstance<OxygenSaturationRecord>()
+
+        assertEquals("-1.0 is the 'no reading' sentinel", 0, records(-1.0).size)
+        assertEquals(0, records(69.9).size)
+        assertEquals(1, records(70.0).size)
+        assertEquals(1, records(100.0).size)
+        assertEquals(0, records(100.1).size)
+    }
+
+    @Test
+    fun `hrv is gated to the 1 to 250 range`() {
+        fun records(hrv: Double) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(hrvMs = hrv), 0L, now)
+            .filterIsInstance<HeartRateVariabilityRmssdRecord>()
+
+        assertEquals(0, records(-1.0).size)
+        assertEquals(0, records(0.9).size)
+        assertEquals(1, records(1.0).size)
+        // 200 ms is Health Connect's own ceiling: asking for more throws
+        // IllegalArgumentException at construction, which would fail the entire batch.
+        assertEquals(1, records(HealthConnectManager.MAX_HRV_MS).size)
+        assertEquals(0, records(HealthConnectManager.MAX_HRV_MS + 0.1).size)
+    }
+
+    @Test
+    fun `resting heart rate and respiratory rate are gated`() {
+        fun resting(bpm: Int) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(restingHeartRate = bpm), 0L, now)
+            .filterIsInstance<RestingHeartRateRecord>()
+
+        assertEquals("0 is the 'no reading' sentinel", 0, resting(0).size)
+        assertEquals(0, resting(29).size)
+        assertEquals(1, resting(30).size)
+        assertEquals(1, resting(150).size)
+        assertEquals(0, resting(151).size)
+
+        fun respiratory(rate: Double) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(respiratoryRate = rate), 0L, now)
+            .filterIsInstance<RespiratoryRateRecord>()
+
+        assertEquals(0, respiratory(-1.0).size)
+        assertEquals(0, respiratory(3.9).size)
+        assertEquals(1, respiratory(4.0).size)
+        assertEquals(1, respiratory(60.0).size)
+        assertEquals(0, respiratory(60.1).size)
+    }
+
+    @Test
+    fun `deltas and distances must be positive to produce a record`() {
+        val manager = HealthConnectManager(context)
+
+        // A zero or negative step delta is not an increment.
+        assertEquals(
+            0,
+            manager.buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = 0L, now)
+                .filterIsInstance<StepsRecord>().size
+        )
+        assertEquals(
+            1,
+            manager.buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = 1L, now)
+                .filterIsInstance<StepsRecord>().size
+        )
+
+        // -1.0 is the 'no reading' sentinel for every double metric.
+        val sentinels = manager.buildTelemetryRecords(
+            WebhookTelemetryPayload(
+                distanceMeters = -1.0,
+                activeCalories = -1.0,
+                floorsClimbed = -1.0
+            ),
+            0L,
+            now
+        )
+        assertEquals("sentinel doubles must not become records", 0, sentinels.size)
+
+        // Zero is not a positive measurement either.
+        val zeros = manager.buildTelemetryRecords(
+            WebhookTelemetryPayload(distanceMeters = 0.0, activeCalories = 0.0, floorsClimbed = 0.0),
+            0L,
+            now
+        )
+        assertEquals(0, zeros.size)
+    }
+
+    @Test
+    fun `sleep sessions are bounded so an overflow cannot invert the interval`() {
+        fun sleep(minutes: Long) = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(sleepMinutes = minutes), 0L, now)
+            .filterIsInstance<SleepSessionRecord>()
+
+        assertEquals("0 and -1 are sentinels", 0, sleep(0).size)
+        assertEquals(0, sleep(-1L).size)
+        assertEquals(1, sleep(1L).size)
+        assertEquals(1, sleep(HealthConnectManager.MAX_SLEEP_MINUTES).size)
+        // Long.MAX_VALUE * 60 overflows to a negative offset, placing the start after the
+        // end and failing the whole insert.
+        assertEquals(0, sleep(HealthConnectManager.MAX_SLEEP_MINUTES + 1).size)
+        assertEquals(0, sleep(Long.MAX_VALUE).size)
+
+        // Whatever is produced must be a valid interval.
+        val record = sleep(420L).single()
+        assertTrue("start must not be after end", record.startTime.isBefore(record.endTime))
+    }
+
+    @Test
+    fun `a fully populated payload produces every writable record type`() {
+        val records = HealthConnectManager(context).buildTelemetryRecords(
+            WebhookTelemetryPayload(
+                heartRate = 72,
+                distanceMeters = 7100.0,
+                activeCalories = 420.0,
+                spo2 = 97.5,
+                floorsClimbed = 12.0,
+                hrvMs = 41.5,
+                restingHeartRate = 52,
+                respiratoryRate = 14.5,
+                sleepMinutes = 455
+            ),
+            stepDelta = 250L,
+            now = now
+        )
+
+        assertEquals("one record per writable metric, plus the step delta", 10, records.size)
+        // Every generated id must be unique within the batch, or the provider would
+        // upsert one record over another.
+        val ids = records.mapNotNull { it.metadata.clientRecordId }
+        assertEquals(records.size, ids.size)
+        assertEquals("record ids must be unique", ids.size, ids.distinct().size)
+    }
+
+    @Test
+    fun `two step deltas in the same hour do not collide on their record id`() {
+        val manager = HealthConnectManager(context)
+
+        fun stepId(at: Instant): String = manager
+            .buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = 100L, at)
+            .filterIsInstance<StepsRecord>()
+            .single()
+            .metadata.clientRecordId!!
+
+        // Ten minutes apart: same hour-aligned window, so a window-keyed id made the
+        // second delta overwrite the first and the hour never accumulated its steps.
+        val firstId = stepId(now)
+        val secondId = stepId(now.plusSeconds(600))
+
+        assertFalse(
+            "step record ids must be unique per delta, not per hour",
+            firstId == secondId
+        )
+    }
+
+    @Test
+    fun `a step record keeps the hour-aligned window as its interval`() {
+        val record = HealthConnectManager(context)
+            .buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = 100L, now)
+            .filterIsInstance<StepsRecord>()
+            .single()
+
+        // The windowing itself is deliberate (D-07b): the interval stays hour-aligned
+        // even though the id is now per-delta.
+        val expectedStart = Instant.ofEpochSecond(BridgePolicy.stepWindowStart(now.epochSecond))
+        assertEquals(expectedStart, record.startTime)
+        assertEquals(expectedStart.plusSeconds(BridgePolicy.STEP_WINDOW_SECONDS), record.endTime)
+        assertEquals(100L, record.count)
+    }
+
+    @Test
+    fun `values above the platform's own ceilings are rejected before construction`() {
+        // Health Connect's record constructors throw for these, and a throw while
+        // building the batch loses every valid record alongside the bad one. Probed
+        // limits: HRV 200 ms, steps 1e6, distance/energy/floors 1e6 of their unit.
+        val manager = HealthConnectManager(context)
+
+        fun steps(delta: Long) = manager
+            .buildTelemetryRecords(WebhookTelemetryPayload(), stepDelta = delta, now)
+            .filterIsInstance<StepsRecord>()
+            .size
+
+        assertEquals(1, steps(HealthConnectManager.MAX_STEPS))
+        assertEquals(0, steps(HealthConnectManager.MAX_STEPS + 1))
+        assertEquals("Long.MAX_VALUE would throw and fail the batch", 0, steps(Long.MAX_VALUE))
+
+        fun distance(meters: Double) = manager
+            .buildTelemetryRecords(WebhookTelemetryPayload(distanceMeters = meters), 0L, now)
+            .filterIsInstance<DistanceRecord>()
+            .size
+
+        assertEquals(1, distance(HealthConnectManager.MAX_DISTANCE_METERS))
+        assertEquals(0, distance(HealthConnectManager.MAX_DISTANCE_METERS + 1.0))
+        assertEquals(0, distance(Double.MAX_VALUE))
+
+        fun calories(kcal: Double) = manager
+            .buildTelemetryRecords(WebhookTelemetryPayload(activeCalories = kcal), 0L, now)
+            .filterIsInstance<ActiveCaloriesBurnedRecord>()
+            .size
+
+        assertEquals(1, calories(HealthConnectManager.MAX_ACTIVE_CALORIES))
+        assertEquals(0, calories(HealthConnectManager.MAX_ACTIVE_CALORIES + 1.0))
+
+        fun floors(value: Double) = manager
+            .buildTelemetryRecords(WebhookTelemetryPayload(floorsClimbed = value), 0L, now)
+            .filterIsInstance<FloorsClimbedRecord>()
+            .size
+
+        assertEquals(1, floors(HealthConnectManager.MAX_FLOORS))
+        assertEquals(0, floors(HealthConnectManager.MAX_FLOORS + 1.0))
+    }
+
+    @Test
+    fun `a payload with one out-of-range metric still writes every valid one`() {
+        // The concrete consequence of the ceilings above: an over-limit HRV threw during
+        // batch construction and the heart rate, steps and sleep in the same payload were
+        // lost with it.
+        val records = HealthConnectManager(context).buildTelemetryRecords(
+            WebhookTelemetryPayload(
+                heartRate = 72,
+                spo2 = 98.0,
+                hrvMs = 5_000.0, // rejected by the gate
+                sleepMinutes = 420
+            ),
+            stepDelta = 500L,
+            now = now
+        )
+
+        assertEquals(4, records.size)
+        assertTrue(records.any { it is HeartRateRecord })
+        assertTrue(records.any { it is OxygenSaturationRecord })
+        assertTrue(records.any { it is StepsRecord })
+        assertTrue(records.any { it is SleepSessionRecord })
+        assertFalse(
+            "the rejected metric must not appear",
+            records.any { it is HeartRateVariabilityRmssdRecord }
+        )
+    }
+
+    @Test
+    fun `every written record type has a matching write permission requested`() {
+        // A size-only assertion silently passed even when a permission was swapped for
+        // an unrelated one, which would make that write fail at runtime.
+        val written = HealthConnectManager(context).buildTelemetryRecords(
+            WebhookTelemetryPayload(
+                heartRate = 72,
+                distanceMeters = 7100.0,
+                activeCalories = 420.0,
+                spo2 = 97.5,
+                floorsClimbed = 12.0,
+                hrvMs = 41.5,
+                restingHeartRate = 52,
+                respiratoryRate = 14.5,
+                sleepMinutes = 455
+            ),
+            stepDelta = 250L,
+            now = now
+        )
+        assertTrue(written.isNotEmpty())
+
+        val required = HealthConnectManager.REQUIRED_PERMISSIONS
+        assertEquals(
+            "each written record type needs its own WRITE permission",
+            written.size,
+            written.map { it::class }.distinct().size
+        )
+        written.forEach { record ->
+            val permission = androidx.health.connect.client.permission.HealthPermission
+                .getWritePermission(record::class)
+            assertTrue(
+                "missing WRITE permission for ${record::class.simpleName}",
+                required.contains(permission)
+            )
+        }
     }
 }

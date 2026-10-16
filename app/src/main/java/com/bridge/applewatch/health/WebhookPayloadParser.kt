@@ -2,6 +2,7 @@ package com.bridge.applewatch.health
 
 import com.bridge.applewatch.model.WebhookTelemetryPayload
 import org.json.JSONObject
+import kotlin.math.roundToLong
 
 /**
  * Universal `/telemetry` body adapter (OPEN-07).
@@ -91,6 +92,7 @@ object WebhookPayloadParser {
         var restingHeartRate = 0
         var respiratoryRate = NO_DOUBLE
         var sleepMinutes = NO_STEPS
+        var sleepHours = NO_DOUBLE
         var battery = NO_INT
 
         for (i in 0 until metrics.length()) {
@@ -117,20 +119,21 @@ object WebhookPayloadParser {
                 { distanceMeters = it }, { activeCalories = it }, { spo2 = it },
                 { floorsClimbed = it }, { hrvMs = it },
                 { restingHeartRate = it.toInt() }, { respiratoryRate = it },
-                { sleepMinutes = it.toLong() }, { battery = it.toInt() }
+                { sleepMinutes = it.toLong() }, { sleepHours = it }, { battery = it.toInt() }
             )
         }
 
         return build(
             heartRate, steps, distanceMeters, activeCalories, spo2, floorsClimbed,
-            hrvMs, restingHeartRate, respiratoryRate, sleepMinutes, battery, control
+            hrvMs, restingHeartRate, respiratoryRate, sleepMinutes, sleepHours,
+            battery, control
         )
     }
 
     /**
      * Applies one Health Auto Export metric to the accumulator slots. HealthKit names
-     * are matched case-insensitively and the `units` field decides metre/kilometre and
-     * fraction/percent scaling.
+     * are matched case-insensitively, and `units` decides the magnitude conversions
+     * (metres vs kilometres vs miles, kilocalories vs kilojoules).
      */
     private inline fun assignMetric(
         name: String,
@@ -145,26 +148,64 @@ object WebhookPayloadParser {
         setHrv: (Double) -> Unit,
         setRestingHr: (Double) -> Unit,
         setRespiratory: (Double) -> Unit,
-        setSleep: (Double) -> Unit,
+        setSleepMinutes: (Double) -> Unit,
+        setSleepHours: (Double) -> Unit,
         setBattery: (Double) -> Unit
     ): Boolean {
         when (name) {
             "heart_rate", "heartrate", "bpm" -> setHeartRate(raw)
             "resting_heart_rate", "restingheartrate" -> setRestingHr(raw)
-            "heart_rate_variability", "heart_rate_variability_sdnn", "hrv", "hrv_sdnn", "hrv_ms" ->
+            // Only RMSSD-named keys populate hrvMs. Apple's HRV is SDNN and Health
+            // Connect's only HRV type is RMSSD, so an SDNN-named key must NOT be
+            // written as RMSSD (D-05) — see WebhookPayloadParserTest.
+            "hrv", "hrv_rmssd", "rmssd" ->
                 setHrv(raw)
             "respiratory_rate", "respiratoryrate" -> setRespiratory(raw)
             "step_count", "steps" -> setSteps(raw)
             "flights_climbed", "floors_climbed" -> setFloors(raw)
-            "active_energy", "active_calories" -> setCalories(raw)
-            "walking_running_distance", "distance" ->
-                setDistance(if (units.startsWith("km")) raw * 1000.0 else raw)
+            "active_energy", "active_calories" -> {
+                // An unrecognised unit yields NaN, which must leave the sentinel in
+                // place rather than assigning a value the gates cannot reason about.
+                val kcal = toKilocalories(raw, units)
+                if (!kcal.isNaN()) setCalories(kcal)
+            }
+            "walking_running_distance", "distance" -> {
+                val meters = toMeters(raw, units)
+                if (!meters.isNaN()) setDistance(meters)
+            }
             "blood_oxygen_saturation", "oxygen_saturation", "spo2" -> setSpo2(scaleSpo2(raw))
-            "sleep_minutes", "sleep_analysis", "sleep" -> setSleep(raw)
+            // Health Auto Export reports sleep_analysis durations in HOURS, so those are
+            // kept in a separate slot and converted later; treating them as minutes
+            // turned a 7.5 h night into a 7-minute session.
+            "sleep_minutes" -> setSleepMinutes(raw)
+            "sleep_analysis", "sleep", "sleep_hours" -> setSleepHours(raw)
             "battery_level", "battery" -> setBattery(scaleBattery(raw))
             else -> return false
         }
         return true
+    }
+
+    /**
+     * Converts a distance reading to metres using the exporter's own `units` field.
+     *
+     * Unknown units return [Double.NaN] so the metric is skipped: assuming metres would
+     * silently write a wrong magnitude (a 3.1 mi walk as 3.1 m).
+     */
+    private fun toMeters(value: Double, units: String): Double = when (units.trim()) {
+        "", "m", "meter", "meters" -> value
+        "km", "kilometer", "kilometers" -> value * 1000.0
+        "mi", "mile", "miles" -> value * 1609.344
+        "yd", "yards" -> value * 0.9144
+        "ft", "feet" -> value * 0.3048
+        else -> Double.NaN
+    }
+
+    /** Converts an energy reading to kilocalories; unknown units are skipped. */
+    private fun toKilocalories(value: Double, units: String): Double = when (units.trim()) {
+        "", "kcal", "cal_metric" -> value
+        "cal", "calories" -> value / 1000.0
+        "kj", "kilojoule", "kilojoules" -> value / 4.184
+        else -> Double.NaN
     }
 
     /**
@@ -209,6 +250,7 @@ object WebhookPayloadParser {
         var restingHeartRate = intOf(root, "restingHeartRate")
         var respiratoryRate = doubleOf(root, "respiratoryRate", NO_DOUBLE)
         var sleepMinutes = longOf(root, "sleepMinutes", NO_STEPS)
+        var sleepHours = NO_DOUBLE
         var battery = intOf(root, "battery", NO_INT)
 
         // Schema 2: Apple Shortcuts snake_case aliases. Each only fills a field the
@@ -219,14 +261,21 @@ object WebhookPayloadParser {
             activeCalories = doubleOfAny(root, NO_DOUBLE, "active_energy", "active_calories")
         }
         if (distanceMeters == NO_DOUBLE) {
-            // The native key is metres; HealthKit's own name is kilometres
-            // (Apple Shortcuts reports it as km), so the two are not interchangeable.
-            distanceMeters = doubleOfAny(root, NO_DOUBLE, "walking_running_distance")
-            if (distanceMeters != NO_DOUBLE) {
-                distanceMeters *= 1000.0
+            // The native `distanceMeters` key is always metres. HealthKit's own metric
+            // name (`walking_running_distance`) carries the user's locale unit, so the
+            // explicit suffixes are preferred and the unsuffixed name is treated as
+            // kilometres, which is how Apple's own exports and Shortcuts report it.
+            val km = doubleOfAny(root, NO_DOUBLE, "distance_km", "walking_running_distance")
+            if (km != NO_DOUBLE) {
+                distanceMeters = km * 1000.0
             } else {
-                val km = doubleOfAny(root, NO_DOUBLE, "distance_km")
-                if (km != NO_DOUBLE) distanceMeters = km * 1000.0
+                val meters = doubleOfAny(root, NO_DOUBLE, "distance_m")
+                if (meters != NO_DOUBLE) {
+                    distanceMeters = meters
+                } else {
+                    val miles = doubleOfAny(root, NO_DOUBLE, "distance_mi")
+                    if (miles != NO_DOUBLE) distanceMeters = miles * 1609.344
+                }
             }
         }
         if (spo2 == NO_DOUBLE) {
@@ -237,11 +286,13 @@ object WebhookPayloadParser {
             floorsClimbed = doubleOfAny(root, NO_DOUBLE, "flights_climbed", "floors_climbed")
         }
         if (hrvMs == NO_DOUBLE) {
-            hrvMs = doubleOfAny(root, NO_DOUBLE, "heart_rate_variability", "hrv_sdnn")
+            // Only RMSSD-named keys. An SDNN value must never be stored as RMSSD (D-05).
+            hrvMs = doubleOfAny(root, NO_DOUBLE, "hrv", "hrv_rmssd", "rmssd")
         }
         if (restingHeartRate == 0) restingHeartRate = intOfAny(root, "resting_heart_rate")
         if (respiratoryRate == NO_DOUBLE) respiratoryRate = doubleOfAny(root, NO_DOUBLE, "respiratory_rate")
         if (sleepMinutes == NO_STEPS) sleepMinutes = longOfAny(root, NO_STEPS, "sleep_minutes")
+        if (sleepHours == NO_DOUBLE) sleepHours = doubleOfAny(root, NO_DOUBLE, "sleep_hours")
         if (battery == NO_INT) {
             // Scale while still a Double: truncating first would turn 0.62 into 0.
             val level = doubleOfAny(root, NO_DOUBLE, "battery_level")
@@ -250,7 +301,8 @@ object WebhookPayloadParser {
 
         return build(
             heartRate, steps, distanceMeters, activeCalories, spo2, floorsClimbed,
-            hrvMs, restingHeartRate, respiratoryRate, sleepMinutes, battery, control
+            hrvMs, restingHeartRate, respiratoryRate, sleepMinutes, sleepHours,
+            battery, control
         )
     }
 
@@ -300,22 +352,36 @@ object WebhookPayloadParser {
         restingHeartRate: Int,
         respiratoryRate: Double,
         sleepMinutes: Long,
+        sleepHours: Double,
         battery: Int,
         controlCommand: String
-    ) = WebhookTelemetryPayload(
-        heartRate = heartRate,
-        steps = steps,
-        distanceMeters = distanceMeters,
-        activeCalories = activeCalories,
-        spo2 = spo2,
-        floorsClimbed = floorsClimbed,
-        hrvMs = hrvMs,
-        restingHeartRate = restingHeartRate,
-        respiratoryRate = respiratoryRate,
-        sleepMinutes = sleepMinutes,
-        battery = battery,
-        controlCommand = controlCommand
-    )
+    ): WebhookTelemetryPayload {
+        // A sleep duration expressed in hours takes precedence over the minutes field:
+        // only one producer reports a given payload, and hours must be converted or a
+        // 7.5 h night becomes a 7-minute session. Non-finite values are ignored so an
+        // overflow cannot invert the session's start and end.
+        val resolvedSleepMinutes = if (sleepHours.isFinite() && sleepHours > 0.0) {
+            (sleepHours * 60.0).roundToLong()
+        } else {
+            sleepMinutes
+        }
+
+        return WebhookTelemetryPayload(
+            heartRate = heartRate,
+            steps = steps,
+            distanceMeters = distanceMeters,
+            activeCalories = activeCalories,
+            spo2 = spo2,
+            floorsClimbed = floorsClimbed,
+            hrvMs = hrvMs,
+            restingHeartRate = restingHeartRate,
+            respiratoryRate = respiratoryRate,
+            sleepMinutes = resolvedSleepMinutes,
+            sleepHours = if (sleepHours.isFinite()) sleepHours else NO_DOUBLE,
+            battery = battery,
+            controlCommand = controlCommand
+        )
+    }
 
     /** HealthKit reports SpO2 as a 0-1 fraction; Health Connect wants 0-100 percent. */
     private fun scaleSpo2(raw: Double): Double =
@@ -363,11 +429,18 @@ object WebhookPayloadParser {
      * Shortcuts' "Get Contents of URL" often stringifies numbers, so a quoted
      * `"74"` is accepted as well as the raw `74`. Anything else (booleans, objects,
      * arrays, `JSONObject.NULL`) is treated as absent.
+     *
+     * **Non-finite values are rejected.** `toDoubleOrNull("1e999")` returns `Infinity`,
+     * which passes every `> 0.0` gate downstream and would construct an infinite
+     * `Length.meters(...)`/`Energy.kilocalories(...)` record; worse, `Infinity.toLong()`
+     * saturates to `Long.MAX_VALUE`, which poisons the persisted step baseline so that
+     * every subsequent step delta becomes 0. `NaN` is already excluded by the
+     * `isNaN()`/range checks, but `Infinity` is not, so it is filtered here.
      */
     private fun numeric(value: Any?): Number? = when (value) {
         null, JSONObject.NULL -> null
-        is Number -> value
-        is String -> value.trim().toDoubleOrNull()
+        is Number -> value.takeIf { it.toDouble().isFinite() }
+        is String -> value.trim().toDoubleOrNull()?.takeIf { it.isFinite() }
         else -> null
     }
 }

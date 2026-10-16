@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Legacy Auto Backup rules for Android 11 and below (the `fullBackupContent` attribute).
+
+  Excludes the optional bridge token so a shared secret is never copied off the device
+  by Auto Backup. See res/xml/data_extraction_rules.xml for the Android 12+ equivalent.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="aw9_bridge_prefs.xml" />
+</full-backup-content>

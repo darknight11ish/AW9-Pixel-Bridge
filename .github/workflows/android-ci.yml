@@ -75,7 +75,11 @@ jobs:
     # The watchOS companion cannot be compiled on Linux, so it gets its own macOS
     # job. This is a real type-check against the watchOS SDK: it catches signature
     # errors (e.g. HKUnit.percent() misuse), not just syntax problems.
-    runs-on: macos-14
+    #
+    # `macos-14` was retired on 2026-11-02 (GitHub announced brownouts from
+    # 2026-10-16), after which every job pinned to it fails at scheduling and the whole
+    # watchOS gate disappears silently. macos-15 is the current oldest supported image.
+    runs-on: macos-15
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -124,36 +128,86 @@ jobs:
           echo "Info.plist lint:"
           plutil -lint Info.plist
 
+      - name: Verify the generated project format is readable by this Xcode
+        # Runs immediately after generation and BEFORE anything opens the project. This
+        # check previously lived in the last step, but the earlier `xcodebuild -list`
+        # aborted first with "Unable to read project ... future Xcode project file
+        # format", so the diagnostic it exists to produce was unreachable.
+        #
+        # The limit is derived from the runner's Xcode rather than hard-coded: Xcode 16
+        # reads objectVersion 77, which Xcode 15 rejects, so a fixed threshold would
+        # reject a project this runner can perfectly well open. `xcodebuild` remains the
+        # real oracle; this is only a fail-fast message.
+        run: |
+          set -o pipefail
+          cd watchos-companion
+
+          # NOTE: no `| head` on `xcodebuild -version`. `head` exits after its first line
+          # and xcodebuild then dies on SIGPIPE with
+          # "NSFileHandleOperationException ... Broken pipe", which intermittently failed
+          # this job. awk consumes all input and selects the first line.
+          OBJECT_VERSION="$(sed -n 's/.*objectVersion = \([0-9]*\);.*/\1/p' \
+            WatchBridgeAgent.xcodeproj/project.pbxproj | awk 'NR==1')"
+          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1')"
+          XCODE_MAJOR="$(echo "$XCODE_VERSION" | sed 's/Xcode //' | cut -d. -f1)"
+
+          case "$XCODE_MAJOR" in
+            1[0-5]) MAX_OBJECT_VERSION=60 ;;
+            16)     MAX_OBJECT_VERSION=77 ;;
+            *)      MAX_OBJECT_VERSION=90 ;;
+          esac
+
+          echo "Generated objectVersion: ${OBJECT_VERSION:-unknown}"
+          echo "Runner Xcode: ${XCODE_VERSION:-unknown} (max objectVersion $MAX_OBJECT_VERSION)"
+
+          if [ -z "$OBJECT_VERSION" ]; then
+            echo "::error::could not read objectVersion from the generated project"
+            exit 1
+          fi
+          if [ "$OBJECT_VERSION" -gt "$MAX_OBJECT_VERSION" ]; then
+            echo "::error::the generated project format is too new for Xcode $XCODE_MAJOR" \
+                 "(objectVersion=$OBJECT_VERSION > $MAX_OBJECT_VERSION)." \
+                 "Check the pinned XcodeGen version."
+            exit 1
+          fi
+
       - name: Verify the generated project carries the required watchOS settings
         # Guards the contract project.yml claims: a standalone, watch-only app whose only
         # transport is plain HTTP to the phone on :8484. If XcodeGen ever stops honouring
         # a key (or a target is dropped) the plist and settings would be wrong in ways
         # `xcodebuild` alone would not catch -- the app would build and then fail at
         # runtime on the watch.
-        #
-        # The checks key off `plutil` exit status rather than comparing captured output,
-        # because the textual form of a boolean differs between `raw` and `json` (-extract
-        # is documented as json/xml/raw). Status codes are unambiguous.
         run: |
           set -o pipefail
           cd watchos-companion
 
-          require_key() {
-            if ! plutil -extract "$1" raw -o /dev/null Info.plist >/dev/null 2>&1; then
-              echo "::error::Info.plist is missing required key: $1"
+          # `WKApplication: false` and an empty usage description both satisfy a
+          # presence-only check while breaking the app, so compare values.
+          require_true() {
+            value="$(plutil -extract "$1" raw -o - Info.plist 2>/dev/null || true)"
+            if [ "$value" != "1" ] && [ "$value" != "true" ]; then
+              echo "::error::Info.plist key '$1' must be true (got '${value:-missing}')"
               exit 1
             fi
-            echo "  present: $1"
+            echo "  $1 = true"
           }
 
-          echo "--- Info.plist required keys ---"
-          require_key WKApplication
-          require_key WKWatchOnly
-          require_key NSHealthShareUsageDescription
-          require_key NSHealthUpdateUsageDescription
+          require_non_empty_string() {
+            value="$(plutil -extract "$1" raw -o - Info.plist 2>/dev/null || true)"
+            if [ -z "$value" ]; then
+              echo "::error::Info.plist key '$1' must be a non-empty string"
+              exit 1
+            fi
+            echo "  $1 is set (${#value} chars)"
+          }
 
-          # ATS must allow the plain-HTTP bridge on the LAN; `-extract ... raw` prints 1
-          # for a true boolean.
+          echo "--- Info.plist required values ---"
+          require_true WKApplication
+          require_true WKWatchOnly
+          require_non_empty_string NSHealthShareUsageDescription
+          require_non_empty_string NSHealthUpdateUsageDescription
+
+          # ATS must allow the plain-HTTP bridge on the LAN.
           ats="$(plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoads raw -o - Info.plist 2>/dev/null || true)"
           if [ "$ats" != "1" ] && [ "$ats" != "true" ]; then
             echo "::error::Info.plist must set NSAppTransportSecurity.NSAllowsArbitraryLoads (got '${ats:-none}')"
@@ -192,6 +246,31 @@ jobs:
           }
           echo "  PRODUCT_BUNDLE_IDENTIFIER = com.bridge.applewatch.watchkitapp"
 
+          # The HealthKit capability must be declared, not just the usage strings:
+          # without the entitlement the app is not authorised for HealthKit, and a
+          # bundle declaring workout-processing is rejected. Checked here because
+          # signing is disabled in CI, so nothing else would notice.
+          #
+          # NOTE: `plutil -extract` treats its argument as a KEYPATH, so the
+          # dot-separated entitlement name `com.apple.developer.healthkit` is read as
+          # nested keys and never matches. Dump the plist and match the key literally
+          # instead.
+          if [ ! -f WatchBridgeAgent.entitlements ]; then
+            echo "::error::project.yml must generate WatchBridgeAgent.entitlements with com.apple.developer.healthkit"
+            exit 1
+          fi
+          if ! plutil -p WatchBridgeAgent.entitlements | grep -q '"com.apple.developer.healthkit"'; then
+            echo "::error::WatchBridgeAgent.entitlements must declare com.apple.developer.healthkit"
+            exit 1
+          fi
+          echo "  entitlements declare com.apple.developer.healthkit"
+          # The entitlement must also actually be wired into the target's build settings.
+          grep -q 'CODE_SIGN_ENTITLEMENTS = WatchBridgeAgent.entitlements' "$XCODEPROJ" || {
+            echo "::error::the target does not reference WatchBridgeAgent.entitlements"
+            exit 1
+          }
+          echo "  CODE_SIGN_ENTITLEMENTS is wired to the target"
+
       - name: Type-check the watchOS companion against the watchOS SDK
         run: |
           set -o pipefail
@@ -208,38 +287,12 @@ jobs:
         # The type-check above is the authoritative Swift gate. This step additionally
         # proves the XcodeGen spec produces a project this runner's Xcode can consume.
         #
-        # XcodeGen 2.44+ emits the newest project format it knows (objectVersion 77, the
-        # Xcode 16 format), which the macos-14 image's Xcode 15.4 refuses outright:
-        # "cannot be opened because it is in a future Xcode project file format (77)".
-        # CI therefore pins XcodeGen 2.43.0 (see the install step). The emitted value is
-        # read back and checked here rather than assumed, so a regression -- or a future
-        # XcodeGen that ignores the pin -- fails loudly with a clear message instead of a
-        # confusing "Unable to read project" error.
+        # The project *format* is checked in its own earlier step, so that a format
+        # mismatch produces its explanatory message instead of aborting here with a bare
+        # "Unable to read project". This step is the actual build.
         run: |
           set -o pipefail
           cd watchos-companion
-
-          # NOTE: deliberately no `| head` on `xcodebuild -version`. `head` exits after
-          # the first line, and xcodebuild then dies on SIGPIPE with
-          # "NSFileHandleOperationException ... Broken pipe", which intermittently fails
-          # this step. awk reads all the input and selects the first line instead.
-          OBJECT_VERSION="$(sed -n 's/.*objectVersion = \([0-9]*\);.*/\1/p' \
-            WatchBridgeAgent.xcodeproj/project.pbxproj | awk 'NR==1')"
-          XCODE_VERSION="$(xcodebuild -version | awk 'NR==1')"
-          XCODE_MAJOR="$(echo "$XCODE_VERSION" | sed 's/Xcode //' | cut -d. -f1)"
-
-          echo "Generated objectVersion: ${OBJECT_VERSION:-unknown}"
-          echo "Runner Xcode: ${XCODE_VERSION:-unknown} (major $XCODE_MAJOR)"
-
-          if [ -z "$OBJECT_VERSION" ]; then
-            echo "::error::could not read objectVersion from the generated project"
-            exit 1
-          fi
-          if [ "$OBJECT_VERSION" -gt 60 ]; then
-            echo "::error::the generated project format is too new for Xcode $XCODE_MAJOR;" \
-                 "objectVersion=$OBJECT_VERSION. Check the pinned XcodeGen version."
-            exit 1
-          fi
 
           xcodebuild -project WatchBridgeAgent.xcodeproj \
             -scheme WatchBridgeAgent \

@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
 import android.media.AudioManager
+import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.view.KeyEvent
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -17,6 +19,10 @@ class PixelControlDispatcher(
     private val scope: CoroutineScope
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    /** The alarm currently playing, so a repeat request coalesces instead of stacking. */
+    private var activeRingtone: Ringtone? = null
+    private var alarmJob: Job? = null
 
     fun executeCommand(command: String): String {
         return when (command.trim().uppercase()) {
@@ -53,12 +59,11 @@ class PixelControlDispatcher(
                 "Decreased Pixel 9 Media Volume"
             }
             "CAMERA_SHUTTER" -> {
-                val dispatched = triggerCameraOrVolumeShutter()
-                if (dispatched) {
-                    "Dispatched Pixel 9 Camera Shutter KeyEvent"
-                } else {
-                    "Camera shutter dispatch failed (broadcast and key event both rejected)"
-                }
+                // Reported as best-effort on purpose. `sendBroadcast` never throws when
+                // no receiver exists, so the previous implementation reported success
+                // whenever the intent was merely *queued* — a claim it could not support.
+                triggerCameraShutterAttempt()
+                "Camera shutter broadcast attempted (no confirmation available)"
             }
             else -> "Ignored Unknown Command: $command"
         }
@@ -72,29 +77,37 @@ class PixelControlDispatcher(
     }
 
     /**
-     * Best-effort shutter dispatch. Returns false when both the broadcast and the
-     * fallback key event failed, so the caller stops reporting a false success (D-09).
+     * Best-effort shutter trigger, targeted at the camera app rather than broadcast
+     * device-wide.
+     *
+     * `sendBroadcast` cannot report whether anything handled the intent, so this returns
+     * nothing and the caller must not claim success (D-09). An earlier version returned
+     * `broadcastOk || keyOk` where `broadcastOk` meant only "sendBroadcast did not
+     * throw", which is always true — so the failure branch was unreachable and the
+     * dashboard always reported a shutter that had almost certainly not fired.
+     *
+     * `setPackage` also stops the intent reaching arbitrary apps, including stopped
+     * packages, from an endpoint that is unauthenticated by default.
      */
-    private fun triggerCameraOrVolumeShutter(): Boolean {
-        var broadcastOk = false
-        try {
-            val intent = Intent("com.google.android.camera.action.SHUTTER").apply {
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+    private fun triggerCameraShutterAttempt() {
+        for (packageName in CAMERA_PACKAGES) {
+            try {
+                val intent = Intent(CAMERA_SHUTTER_ACTION).setPackage(packageName)
+                context.sendBroadcast(intent)
+            } catch (e: Exception) {
+                // Not installed or refuses the broadcast; try the next candidate.
+                continue
             }
-            context.sendBroadcast(intent)
-            broadcastOk = true
-        } catch (_: Exception) {
         }
-        val keyOk = try {
-            dispatchMediaKey(KeyEvent.KEYCODE_CAMERA)
-            true
-        } catch (_: Exception) {
-            false
-        }
-        return broadcastOk || keyOk
     }
 
     private fun triggerFindMyPixelAlarm() {
+        // Coalesce repeats: pressing RING repeatedly used to start an overlapping
+        // Ringtone and 5-second coroutine per request, so the live-object count grew
+        // with the request rate.
+        alarmJob?.cancel()
+        activeRingtone?.stop()
+
         val vibrator = context.getSystemService(Vibrator::class.java)
         vibrator?.vibrate(
             VibrationEffect.createWaveform(longArrayOf(0, 500, 200, 500, 200, 800), -1)
@@ -107,9 +120,22 @@ class PixelControlDispatcher(
             .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
             .build()
         ringtone?.play()
-        scope.launch {
-            delay(5000L)
-            ringtone?.stop()
+        activeRingtone = ringtone
+        alarmJob = scope.launch {
+            delay(ALARM_DURATION_MS)
+            activeRingtone?.stop()
+            activeRingtone = null
         }
+    }
+
+    private companion object {
+        /** Camera intents are app-specific; there is no standard system broadcast. */
+        val CAMERA_PACKAGES = listOf(
+            "com.google.android.GoogleCamera",
+            "com.android.camera2",
+            "com.android.camera"
+        )
+        const val CAMERA_SHUTTER_ACTION = "com.google.android.camera.action.SHUTTER"
+        const val ALARM_DURATION_MS = 5_000L
     }
 }

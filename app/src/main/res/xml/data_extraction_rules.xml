@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Backup rules for Android 12+ (API 31+).
+
+  The optional bridge token is a shared secret that gates the control endpoint, and it
+  lives in the plain `aw9_bridge_prefs` SharedPreferences file. With Android's default
+  Auto Backup enabled that file was copied off the device, which contradicts the app's
+  own claim that no data leaves the local network and makes the secret recoverable from
+  any device backup. Both cloud backup and device-to-device transfer therefore exclude
+  it. Everything else in the app remains backed up.
+
+  The pre-Android-12 equivalent lives in res/xml/backup_rules.xml.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="aw9_bridge_prefs.xml" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="aw9_bridge_prefs.xml" />
+    </device-transfer>
+</data-extraction-rules>

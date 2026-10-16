@@ -56,6 +56,16 @@ targets:
           delivering live samples while the bridge is streaming.
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
+    # The HealthKit *capability*, which is an entitlement and cannot live in
+    # Info.plist. The usage strings above are the plist half; without
+    # `com.apple.developer.healthkit` the app is not authorised for HealthKit at all,
+    # and a bundle declaring UIBackgroundModes=workout-processing is rejected with
+    # "without the required entitlement 'com.apple.developer.healthkit'". Signing is
+    # disabled in CI, so the workflow asserts this file's contents explicitly.
+    entitlements:
+      path: WatchBridgeAgent.entitlements
+      properties:
+        com.apple.developer.healthkit: true
     settings:
       base:
         GENERATE_INFOPLIST_FILE: NO
