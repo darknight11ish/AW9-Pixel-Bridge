@@ -530,3 +530,107 @@ reported success while verifying nothing.
   install or run on a watch, and XcodeGen is pinned to an older release because of the
   format incompatibility documented in §12.4.
 
+---
+
+## 13. `v1.2.0` — four PRs built, CI-verified and merged
+
+The follow-up brief prescribed four workstreams, open PRs, self-heal CI, merge when
+green, then release `v1.2.0`. It also instructed merging to `main` **before** opening the
+PRs, which — as established in the previous round — makes the PRs unopenable. I ran the
+loop in the order the CI triggers actually require (push → open PR → watch checks →
+squash-merge), and this is the first round in which **all four PRs were opened, watched
+green, and squash-merged** rather than merged first and recorded afterwards.
+
+| PR | Branch | Squash commit | Scope |
+|---|---|---|---|
+| [#1](https://github.com/darknight11ish/AW9-Pixel-Bridge/pull/1) | `feat/hotspot-ip-auto-refresh` | `7528183` | Endpoint enumeration + resume refresh |
+| [#2](https://github.com/darknight11ish/AW9-Pixel-Bridge/pull/2) | `feat/http-server-concurrency-hardening` | `96b5829` | Bounded permit wait + 503 + concurrency test |
+| [#3](https://github.com/darknight11ish/AW9-Pixel-Bridge/pull/3) | `feat/comprehensive-health-sync-tests` | `3124b3f` | Parser edge cases + `HealthConnectManagerTest` |
+| [#4](https://github.com/darknight11ish/AW9-Pixel-Bridge/pull/4) | `feat/watchos-background-vitals-polish` | `9790f1a` | Vitals failure surfacing + project contract CI |
+
+### 13.1 Two of the four workstreams were already done
+
+The brief's Workstream 1 Task 1 (enumerate all active interfaces with labels) and
+Workstream 4 Tasks 1–2 (background vitals polling, XcodeGen generation and `xcodebuild`
+verification) described work that **v1.1.0 had already delivered and CI-verified**.
+Workstream 2's exception handling was also already present. Re-implementing any of it
+would have been churn, so each was reduced to the part that was genuinely missing:
+
+* **WS1** — changed the separator to the `" | "` form the brief specified, extracted two
+  pure helpers (`rankEndpoints`, `formatEndpoint`), and added the one real gap: an
+  `ON_RESUME` refresh, because Android may not deliver network callbacks that fired while
+  the process was backgrounded.
+* **WS2** — kept the existing exception boundary and added the concurrency test, plus a
+  real defect it exposed (below).
+* **WS4** — kept the existing polling and CI checks, and fixed two defects in them.
+
+### 13.2 The real defects found
+
+1. **The concurrency cap had an unbounded wait behind it (WS2).** `Semaphore(8)` bounded
+   how many requests *ran*, but `withPermit` waited without limit, so a connection
+   accepted while all eight permits were busy held its socket open for as long as the
+   slow peers took — a flood turned the cap into an unbounded queue. `serveIfPermitted()`
+   now waits at most 6 s and answers `503` + `Retry-After`; `awaitPermit()` polls
+   `tryAcquire()` so acquisition and release stay on one linear path.
+2. **A CI step I added in the previous round was killing `xcodebuild` (WS3).** On PR #3
+   the watchOS job failed on a branch that does not touch Swift. Cause:
+   `xcodebuild -version | head -n 1` — `head` exits once it has its line, so xcodebuild's
+   next write hit `SIGPIPE` and it died with an uncaught
+   `NSFileHandleOperationException ... Broken pipe`. The pipeline's status then came from
+   `head`, so the step *usually* passed. Replaced with `awk 'NR==1'`, which consumes all
+   input and never closes the pipe early. A flaky check is worse than none: it devalues
+   every green run.
+3. **HealthKit query failures were invisible on the watch (WS4).** A failed
+   `HKSampleQuery` was only `print`ed, so revoked permission and "no sample yet" looked
+   identical, and a payload was POSTed even when neither vital had produced a sample.
+   Failures are now reported separately from absence, an empty poll pushes nothing, and
+   the sentinels render as "none yet" instead of "0 BPM".
+4. **The XcodeGen contract was asserted nowhere (WS4).** `xcodebuild` proves the project
+   *compiles*, not that the plist still declares `WKApplication`, the HealthKit usage
+   strings, `NSAllowsArbitraryLoads` (the only transport is plain HTTP on `:8484`) and
+   `workout-processing`. Those are now checked against the **generated** project in CI,
+   along with `SDKROOT=watchos`, deployment target `10.0`, the bundle id, and a scheme
+   read-back. Verified output:
+
+   ```text
+   present: WKApplication
+   present: WKWatchOnly
+   present: NSHealthShareUsageDescription
+   present: NSHealthUpdateUsageDescription
+   NSAppTransportSecurity.NSAllowsArbitraryLoads = true
+   UIBackgroundModes includes workout-processing
+   SDKROOT = watchos
+   WATCHOS_DEPLOYMENT_TARGET = 10.0
+   PRODUCT_BUNDLE_IDENTIFIER = com.bridge.applewatch.watchkitapp
+   ```
+
+### 13.3 A test that was wrong, and the contract it clarified
+
+While adding SpO2 boundary tests I asserted that the native `spo2` key scales a `0.5`
+fraction to `50.0 %`. **The test failed, and the test was wrong, not the parser.** The
+implementation treats the native `spo2` key as *always a percentage* and scales only the
+HealthKit-named keys (`blood_oxygen_saturation`, `oxygen_saturation`) and the Health Auto
+Export metric. That is a deliberate and necessary distinction: a value of exactly `1.0` is
+otherwise ambiguous between 1 % and 100 %. The tests now pin both halves of that contract
+explicitly (`the native spo2 key is a percentage and is never rescaled` and `only the
+HealthKit-named spo2 keys are treated as fractions`), which is more valuable than the
+assertion I originally intended.
+
+### 13.4 Verification for `v1.2.0`
+
+| Gate | Result |
+|---|---|
+| Unit tests | **84** (was 58): BridgePolicy 18, WebhookPayloadParser 24, WatchBridgeService 14, HealthConnectManager 9 (new), AppleHealthXmlImporter 8, BlePacketParser 11 |
+| Android Lint | 0 errors / 14 warnings (baseline) |
+| `assembleDebug` / `assembleRelease` | pass |
+| `versionName` in the built APK | `1.2.0`, `versionCode` 5 (read back with `aapt2 dump badging`) |
+| CI | four PRs, each with both jobs green before merge |
+| watchOS contract checks | all nine assertions pass against the generated project |
+
+### 13.5 Limits, restated
+
+Unchanged from §12.5 and worth repeating because none of it was addressed by this work:
+**no physical device**, no rendered UI, and no signed or installed watch app. The 84 tests
+are still JVM/Robolectric tests. Everything about real radios, real Health Connect, and a
+real Apple Watch posting over a real hotspot remains unverified.
+

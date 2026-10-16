@@ -86,6 +86,11 @@ Only loopback and RFC1918 (private LAN) peers are served. An optional shared sec
 (`X-Bridge-Token`, also accepted as a `authToken` JSON field) can be set from the
 dashboard's **Webhook Security** card.
 
+The server handles at most 8 requests at once. A request that arrives while all 8 are
+busy waits briefly for a slot; if it still cannot get one it is answered with
+`503 Service Unavailable` and `Retry-After`, rather than being left hanging or queued
+without limit. A well-behaved client should retry on 503.
+
 ---
 
 ## 2. Three ways to connect an Apple Watch
@@ -182,18 +187,18 @@ the DHCP server, so no router configuration or client isolation can interfere.
 1. Enable **Settings → Network → Hotspot & tethering → Wi-Fi hotspot** on the Pixel 9.
 2. On the watch: **Settings → Wi-Fi → join the hotspot SSID** (enter the password on
    the watch — there is no Android equivalent of Apple's Instant Hotspot).
-3. Open the bridge app. The webhook card lists every usable interface, **hotspot
-   first**, e.g.:
+3. Open the bridge app. The webhook card lists **every** usable interface on one line,
+   **hotspot first**, e.g.:
 
    ```text
-   Hotspot (ap0): http://192.168.43.1:8484/telemetry
-   Wi-Fi (wlan0): http://192.168.1.25:8484/telemetry
+   Hotspot (ap0): http://192.168.43.1:8484/telemetry | Wi-Fi (wlan0): http://192.168.1.25:8484/telemetry
    ```
 
-   Addresses are re-resolved automatically when Wi-Fi or the hotspot toggles, and
-   **Refresh IP** forces it manually. Use the `192.168.43.1` entry from the watch —
-   a plain `192.168.x.x` router address is not reachable while the watch is on the
-   hotspot.
+   Each entry is labelled with the interface's role, so you can tell which address the
+   watch can actually reach. Addresses are re-resolved automatically when Wi-Fi or the
+   hotspot toggles **and** whenever the app returns to the foreground, and **Refresh IP**
+   forces it manually. Use the `192.168.43.1` entry from the watch — a plain
+   `192.168.x.x` router address is not reachable while the watch is on the hotspot.
 4. Optional hardening: in **Webhook Security**, save a shared token. The watch side
    (Shortcut header, Health Auto Export header, or the companion app's token field)
    must then send the same value as `X-Bridge-Token`.
