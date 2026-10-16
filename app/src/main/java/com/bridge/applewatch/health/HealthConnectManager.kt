@@ -6,6 +6,7 @@ import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
 import androidx.health.connect.client.records.metadata.Metadata
+import androidx.health.connect.client.response.InsertRecordsResponse
 import androidx.health.connect.client.units.*
 import com.bridge.applewatch.model.WebhookTelemetryPayload
 import com.bridge.applewatch.service.BridgePolicy
@@ -253,9 +254,8 @@ class HealthConnectManager(context: Context) {
      * accepted. A bare `records.size` over-reports when the provider upserts or
      * deduplicates (D-07).
      */
-    @SuppressLint("RestrictedApi")
     private suspend fun insertAndCount(hc: HealthConnectClient, records: List<Record>): Int =
-        if (records.isEmpty()) 0 else hc.insertRecords(records).recordIdsList.size
+        if (records.isEmpty()) 0 else hc.insertRecords(records).committedCount(records.size)
 
     suspend fun insertBatchRecords(records: List<Record>): Int {
         val hc = client ?: return 0
@@ -267,3 +267,25 @@ class HealthConnectManager(context: Context) {
         return totalInserted
     }
 }
+
+/**
+ * The number of records the provider committed for this insert.
+ *
+ * `InsertRecordsResponse.recordIdsList` is the only way to learn how many records were
+ * actually written rather than merely submitted, since Health Connect may replace or
+ * ignore records that share a `clientRecordId`. The accessor is annotated `@RestrictTo`,
+ * i.e. it is not part of the stable public contract (OPEN-04), so it is isolated here
+ * behind one function instead of leaking through the manager:
+ *
+ * - [@SuppressLint] documents the deliberate non-contract use so the lint gate stays
+ *   meaningful for every *other* RestrictedApi reference in this module.
+ * - If a future `connect-client` removes or renames the accessor, [runCatching] means
+ *   the sync degrades to the conservative [fallback] (the submitted count) instead of
+ *   crashing the service mid-insert.
+ *
+ * Callers must pass the number of records submitted so the fallback cannot silently
+ * report 0, which would make a successful sync look like a no-op.
+ */
+@SuppressLint("RestrictedApi")
+private fun InsertRecordsResponse.committedCount(fallback: Int): Int =
+    runCatching { recordIdsList.size }.getOrDefault(fallback)
