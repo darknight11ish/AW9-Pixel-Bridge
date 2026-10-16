@@ -196,4 +196,204 @@ class WebhookPayloadParserTest {
         assertEquals(1200L, payload.steps)
         assertEquals(84, payload.battery)
     }
+
+    // ------------------------------------------------------ edge cases (OPEN-08)
+
+    @Test
+    fun `spo2 boundary values are passed through without clamping`() {
+        // The parser must not clamp: 70.0 and 100.0 are inside the downstream
+        // `in 70.0..100.0` gate, and a value outside it must stay outside so
+        // HealthConnectManager skips the record instead of writing a fabricated one.
+        assertEquals(70.0, WebhookPayloadParser.parse("""{"spo2":70.0}""").spo2, 1e-9)
+        assertEquals(100.0, WebhookPayloadParser.parse("""{"spo2":100.0}""").spo2, 1e-9)
+        assertEquals(69.9, WebhookPayloadParser.parse("""{"spo2":69.9}""").spo2, 1e-9)
+        assertEquals(100.1, WebhookPayloadParser.parse("""{"spo2":100.1}""").spo2, 1e-9)
+    }
+
+    @Test
+    fun `the native spo2 key is a percentage and is never rescaled`() {
+        // Documented contract: `spo2` is this project's own field, so it always carries
+        // a 0-100 percentage. Only the HealthKit-named keys are treated as fractions.
+        // That is what disambiguates 1.0, which would otherwise be both 1 % and 100 %.
+        assertEquals(1.0, WebhookPayloadParser.parse("""{"spo2":1.0}""").spo2, 1e-9)
+        assertEquals(0.5, WebhookPayloadParser.parse("""{"spo2":0.5}""").spo2, 1e-9)
+        assertEquals(0.4, WebhookPayloadParser.parse("""{"spo2":0.4}""").spo2, 1e-9)
+        assertEquals(98.0, WebhookPayloadParser.parse("""{"spo2":98.0}""").spo2, 1e-9)
+    }
+
+    @Test
+    fun `only the HealthKit-named spo2 keys are treated as fractions`() {
+        // HKUnit.percent() renders 98.5 % as 0.985, so a 0.5-1.0 value under a HealthKit
+        // name must be scaled to a percentage.
+        assertEquals(
+            98.5,
+            WebhookPayloadParser.parse("""{"blood_oxygen_saturation":0.985}""").spo2,
+            1e-9
+        )
+        assertEquals(
+            100.0,
+            WebhookPayloadParser.parse("""{"oxygen_saturation":1.0}""").spo2,
+            1e-9
+        )
+        // Already a percentage: it must NOT be multiplied again.
+        assertEquals(
+            98.0,
+            WebhookPayloadParser.parse("""{"oxygen_saturation":98.0}""").spo2,
+            1e-9
+        )
+        // Below 0.5 is not a plausible fraction, so it is left alone and stays out of
+        // the downstream range check rather than becoming a fabricated 40 %.
+        assertEquals(
+            0.4,
+            WebhookPayloadParser.parse("""{"blood_oxygen_saturation":0.4}""").spo2,
+            1e-9
+        )
+        // Health Auto Export's nested form scales the same way.
+        assertEquals(
+            99.0,
+            WebhookPayloadParser.parse(
+                """{"data":{"metrics":[{"name":"blood_oxygen_saturation","data":[{"qty":0.99}]}]}}"""
+            ).spo2,
+            1e-9
+        )
+    }
+
+    @Test
+    fun `negative readings are preserved rather than clamped to zero`() {
+        // A negative sentinel is meaningful: it tells the writer there was no reading.
+        val payload = WebhookPayloadParser.parse(
+            """{"steps":-1,"distanceMeters":-5.0,"activeCalories":-2.5,"hrvMs":-3.0,"battery":-1}"""
+        )
+        assertEquals(-1L, payload.steps)
+        assertEquals(-5.0, payload.distanceMeters, 1e-9)
+        assertEquals(-2.5, payload.activeCalories, 1e-9)
+        assertEquals(-3.0, payload.hrvMs, 1e-9)
+        assertEquals(-1, payload.battery)
+    }
+
+    @Test
+    fun `a partially populated payload leaves the untouched fields at their sentinels`() {
+        val payload = WebhookPayloadParser.parse("""{"heart_rate":66,"steps":5000,"spo2":98.0}""")
+        assertEquals(66, payload.heartRate)
+        assertEquals(5000L, payload.steps)
+        assertEquals(98.0, payload.spo2, 1e-9)
+        // Everything else must stay "no reading".
+        assertEquals(-1L, payload.sleepMinutes)
+        assertEquals(0, payload.restingHeartRate)
+        assertEquals(-1.0, payload.respiratoryRate, 1e-9)
+        assertEquals(-1.0, payload.floorsClimbed, 1e-9)
+        assertEquals(-1.0, payload.distanceMeters, 1e-9)
+        assertEquals("", payload.controlCommand)
+    }
+
+    @Test
+    fun `wrong value types are treated as absent instead of throwing`() {
+        val payload = WebhookPayloadParser.parse(
+            """{"heartRate":{"nested":1},"steps":[1,2],"spo2":true,
+                "distanceMeters":"not-a-number","battery":null}"""
+        )
+        val expected = WebhookTelemetryPayload()
+        assertEquals(expected, payload)
+    }
+
+    @Test
+    fun `explicit json nulls are treated as absent`() {
+        val payload = WebhookPayloadParser.parse(
+            """{"heartRate":null,"steps":null,"spo2":null,"controlCommand":null}"""
+        )
+        val expected = WebhookTelemetryPayload()
+        assertEquals(expected, payload)
+        assertEquals("", payload.controlCommand)
+    }
+
+    @Test
+    fun `malformed nested metric arrays are skipped without losing valid metrics`() {
+        val payload = WebhookPayloadParser.parse(
+            """
+            {"data":{"metrics":[
+              {"name":"heart_rate","units":"bpm","data":[{"Avg":72}]},
+              {"name":"step_count"},
+              {"data":[{"qty":10}]},
+              {"name":"spo2","data":"not-an-array"},
+              {"name":"flights_climbed","data":[{"qty":"abc"}]},
+              {"name":"resting_heart_rate","data":[{"qty":49}]}
+            ]}}
+            """.trimIndent()
+        )
+        // The two well-formed metrics survive; the malformed ones are skipped silently.
+        assertEquals(72, payload.heartRate)
+        assertEquals(49, payload.restingHeartRate)
+        assertEquals(-1L, payload.steps)
+        assertEquals(-1.0, payload.spo2, 1e-9)
+        assertEquals(-1.0, payload.floorsClimbed, 1e-9)
+    }
+
+    @Test
+    fun `metrics with a missing name are ignored`() {
+        val payload = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"units":"bpm","data":[{"qty":99}]},{"name":"heart_rate","data":[{"qty":61}]}]}}"""
+        )
+        assertEquals("a nameless metric must not be guessed", 61, payload.heartRate)
+    }
+
+    @Test
+    fun `an empty metrics array yields the default payload`() {
+        val expected = WebhookTelemetryPayload()
+        assertEquals(expected, WebhookPayloadParser.parse("""{"data":{"metrics":[]}}"""))
+        // `data` present but without `metrics` falls back to the flat reader.
+        assertEquals(expected, WebhookPayloadParser.parse("""{"data":{}}"""))
+    }
+
+    @Test
+    fun `a flat payload wrapped in data is still read`() {
+        val payload = WebhookPayloadParser.parse("""{"data":{"heart_rate":64,"step_count":321}}""")
+        assertEquals(64, payload.heartRate)
+        assertEquals(321L, payload.steps)
+    }
+
+    @Test
+    fun `control command aliases are resolved in a stable priority order`() {
+        assertEquals(
+            "MEDIA_NEXT",
+            WebhookPayloadParser.parse("""{"controlCommand":"MEDIA_NEXT"}""").controlCommand
+        )
+        assertEquals(
+            "MEDIA_NEXT",
+            WebhookPayloadParser.parse("""{"control_command":"MEDIA_NEXT"}""").controlCommand
+        )
+        // The native key wins when both native and snake_case forms are present.
+        assertEquals(
+            "NATIVE_WINS",
+            WebhookPayloadParser.parse(
+                """{"controlCommand":"NATIVE_WINS","control_command":"SNAKE"}"""
+            ).controlCommand
+        )
+        // A blank native key must not mask a usable snake_case one.
+        assertEquals(
+            "FROM_SNAKE",
+            WebhookPayloadParser.parse(
+                """{"controlCommand":"  ","control_command":"FROM_SNAKE"}"""
+            ).controlCommand
+        )
+        assertEquals(
+            "FIND_MY_PIXEL",
+            WebhookPayloadParser.parse("""{"find_my_pixel":true}""").controlCommand
+        )
+        assertEquals(
+            "FIND_MY_PIXEL",
+            WebhookPayloadParser.parse("""{"ring_pixel":true}""").controlCommand
+        )
+    }
+
+    @Test
+    fun `step and distance sums tolerate a mixture of sample shapes`() {
+        val payload = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[
+                 {"name":"step_count","data":[{"qty":100},{"Avg":50},{"qty":"25"}]},
+                 {"name":"walking_running_distance","units":"km","data":[{"qty":1.0},{"qty":0.25}]}
+               ]}}"""
+        )
+        assertEquals(175L, payload.steps)
+        assertEquals(1250.0, payload.distanceMeters, 1e-9)
+    }
 }

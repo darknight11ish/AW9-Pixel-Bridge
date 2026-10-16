@@ -31,6 +31,12 @@ class HealthConnectManager(context: Context) {
     val isAvailable: Boolean get() = client != null
 
     companion object {
+        /**
+         * Maximum records submitted per `insertRecords` call. Health Connect rejects
+         * very large batches, so a 5,000-record XML import is split into these.
+         */
+        const val BATCH_CHUNK_SIZE = 500
+
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getWritePermission(HeartRateRecord::class),
             HealthPermission.getReadPermission(HeartRateRecord::class),
@@ -257,11 +263,23 @@ class HealthConnectManager(context: Context) {
     private suspend fun insertAndCount(hc: HealthConnectClient, records: List<Record>): Int =
         if (records.isEmpty()) 0 else hc.insertRecords(records).committedCount(records.size)
 
+    /**
+     * Splits a batch into the chunks Health Connect accepts in one `insertRecords` call.
+     *
+     * Pure and side-effect free so the chunk boundaries can be asserted directly
+     * (OPEN-08), rather than only being reachable through a live client. Order is
+     * preserved, so a caller that logs or retries by chunk index sees a stable sequence.
+     */
+    internal fun splitIntoBatches(
+        records: List<Record>,
+        chunkSize: Int = BATCH_CHUNK_SIZE
+    ): List<List<Record>> = if (records.isEmpty()) emptyList() else records.chunked(chunkSize)
+
     suspend fun insertBatchRecords(records: List<Record>): Int {
         val hc = client ?: return 0
         if (records.isEmpty()) return 0
         var totalInserted = 0
-        records.chunked(500).forEach { chunk ->
+        splitIntoBatches(records).forEach { chunk ->
             totalInserted += insertAndCount(hc, chunk)
         }
         return totalInserted
