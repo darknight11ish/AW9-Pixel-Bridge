@@ -42,6 +42,9 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     /// Latest respiratory rate in breaths/min. -1.0 means "no reading yet" and is
     /// likewise skipped by the Android side's 4...60 range check.
     @Published var respiratoryRate: Double = -1.0
+    /// Last value sent for each telemetry field, so only changes are transmitted.
+    /// Cleared when a session starts, so the first sample of a new workout always sends.
+    private var lastSentTelemetry: [String: Double] = [:]
     @Published var isStreaming = false
     @Published var lastPushStatus: String = "Idle"
 
@@ -58,6 +61,9 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
             lastPushStatus = "Already streaming"
             return
         }
+        // A new session's cumulative metrics start from zero again, so the previous
+        // session's last-sent values must not suppress this session's first sample.
+        lastSentTelemetry.removeAll()
 
         let typesToShare: Set = [HKObjectType.workoutType()]
         let typesToRead: Set = [
@@ -337,12 +343,24 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
         }
     }
 
-    func postTelemetryToPixel(controlCommand: String) {
-        guard let url = URL(string: "http://\(pixelIp):8484/telemetry") else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        applyBridgeToken(to: &req)
+    /// Sends only the telemetry that has actually changed since the last send.
+    ///
+    /// The phone writes whatever it receives as a fresh record stamped `now`, so sending
+    /// every field on every sample re-committed workout-cumulative and stale values as
+    /// new clinical records: `activeKcal`/`distanceM`/`floors` are HealthKit *workout
+    /// sums*, and `spo2`/`restingHr`/`respiratoryRate` are last-known readings. During a
+    /// 30-minute run with ~200 heart-rate samples that produced ~200 DistanceRecords
+    /// whose values grew to the whole workout total (Health Connect sums distance and
+    /// energy over records), and one SpO2 reading became hundreds of records at times no
+    /// measurement was taken.
+    ///
+    /// `steps` is deliberately sent as the cumulative daily total whenever it changes,
+    /// because the phone computes the delta against its own persisted baseline.
+    ///
+    /// Returns false when nothing changed, in which case no request is made at all.
+    @discardableResult
+    func postTelemetryToPixel(controlCommand: String) -> Bool {
+        guard let url = URL(string: "http://\(pixelIp):8484/telemetry") else { return false }
 
         // `batteryLevel` is -1.0 when no reading is available. Clamping that to 0
         // published a fabricated "0 %" watch battery; the phone skips any value outside
@@ -350,23 +368,43 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
         let rawLevel = WKInterfaceDevice.current().batteryLevel
         let battery = rawLevel < 0 ? -1 : Int(min(1.0, rawLevel) * 100)
 
-        var payload: [String: Any] = [
-            "heartRate": liveBpm,
-            "steps": Int(steps),
-            "activeCalories": activeKcal,
-            "distanceMeters": distanceM,
-            "spo2": spo2,
-            "floorsClimbed": floors,
-            // NOTE: `hrvMs` (SDNN) is deliberately omitted — see the SDNN case in
-            // workoutBuilder(didCollectDataOf:). Only `restingHeartRate` and
-            // `respiratoryRate` are added below.
-            "restingHeartRate": restingHr,
-            "respiratoryRate": respiratoryRate,
-            "battery": battery
+        // Candidate fields in a fixed order so a payload is deterministic.
+        let candidates: [(String, Double)] = [
+            ("heartRate", Double(liveBpm)),
+            ("steps", Double(Int(steps))),
+            ("activeCalories", activeKcal),
+            ("distanceMeters", distanceM),
+            ("spo2", spo2),
+            ("floorsClimbed", floors),
+            // `hrvMs` (SDNN) is deliberately absent: it is not RMSSD, so writing it to
+            // Health Connect would mislabel the metric (see the SDNN case in
+            // workoutBuilder(didCollectDataOf:)).
+            ("restingHeartRate", Double(restingHr)),
+            ("respiratoryRate", respiratoryRate),
+            ("battery", Double(battery))
         ]
+
+        var payload: [String: Any] = [:]
+        for (key, value) in candidates {
+            if lastSentTelemetry[key] == value { continue }
+            lastSentTelemetry[key] = value
+            payload[key] = key == "heartRate" || key == "steps" ||
+                key == "restingHeartRate" || key == "battery"
+                ? Int(value)
+                : value
+        }
+
         if !controlCommand.isEmpty {
             payload["controlCommand"] = controlCommand
         }
+
+        // Nothing changed and there is no command to send: do not contact the phone.
+        if payload.isEmpty { return false }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyBridgeToken(to: &req)
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
         URLSession.shared.dataTask(with: req) { _, response, error in
             let status: String
@@ -386,6 +424,7 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
             }
             DispatchQueue.main.async { self.lastPushStatus = status }
         }.resume()
+        return true
     }
 
     func workoutBuilderDidCollectEvent(_ workoutBuilder: HKLiveWorkoutBuilder) {}

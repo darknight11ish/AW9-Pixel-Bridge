@@ -182,7 +182,9 @@ object AppleHealthXmlImporter {
             }
             "HKQuantityTypeIdentifierStepCount" -> {
                 val count = numericVal.toLong()
-                if (count <= 0L) null else StepsRecord(
+                // Ceilings match Health Connect's constructors: exceeding one throws inside
+                // this scan and the catch would abandon the rest of the file.
+                if (count !in 1..HealthConnectManager.MAX_STEPS) null else StepsRecord(
                     startTime = startInstant,
                     startZoneOffset = startZoneOffset,
                     endTime = endInstant,
@@ -193,7 +195,7 @@ object AppleHealthXmlImporter {
             }
             "HKQuantityTypeIdentifierDistanceWalkingRunning" -> {
                 val meters = distanceMeters(numericVal, unit) ?: return null
-                if (meters <= 0.0) null else DistanceRecord(
+                if (meters <= 0.0 || meters > HealthConnectManager.MAX_DISTANCE_METERS) null else DistanceRecord(
                     startTime = startInstant,
                     startZoneOffset = startZoneOffset,
                     endTime = endInstant,
@@ -204,7 +206,7 @@ object AppleHealthXmlImporter {
             }
             "HKQuantityTypeIdentifierActiveEnergyBurned" -> {
                 val kcal = energyKilocalories(numericVal, unit) ?: return null
-                if (kcal <= 0.0) null else ActiveCaloriesBurnedRecord(
+                if (kcal <= 0.0 || kcal > HealthConnectManager.MAX_ACTIVE_CALORIES) null else ActiveCaloriesBurnedRecord(
                     startTime = startInstant,
                     startZoneOffset = startZoneOffset,
                     endTime = endInstant,
@@ -226,7 +228,7 @@ object AppleHealthXmlImporter {
             "HKQuantityTypeIdentifierHeartRateVariabilitySDNN" -> {
                 // Health Connect has no SDNN record type; writing SDNN into
                 // HeartRateVariabilityRmssdRecord would mislabel the metric (D-05).
-                if (!includeSdnnAsRmssd || numericVal !in 1.0..250.0) null
+                if (!includeSdnnAsRmssd || numericVal !in 1.0..HealthConnectManager.MAX_HRV_MS) null
                 else HeartRateVariabilityRmssdRecord(
                     time = startInstant,
                     zoneOffset = startZoneOffset,

@@ -111,7 +111,11 @@ class HealthConnectManager(context: Context) {
 
     suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant = Instant.now()) {
         val hc = client ?: return
-        if (rmssdMs !in 1.0..250.0) return
+        // Must use the platform ceiling, not 250: HeartRateVariabilityRmssdRecord throws
+        // IllegalArgumentException above 200 ms. This path has no try/catch and its only
+        // caller launches it fire-and-forget, so an out-of-range value escaped as an
+        // uncaught coroutine exception rather than a skipped record.
+        if (rmssdMs !in 1.0..MAX_HRV_MS) return
         val offset = ZoneOffset.systemDefault().rules.getOffset(timestamp)
         val record = HeartRateVariabilityRmssdRecord(
             time = timestamp,
@@ -202,9 +206,7 @@ class HealthConnectManager(context: Context) {
                     endTime = bucketEnd,
                     endZoneOffset = bucketOffset,
                     count = stepDelta,
-                    metadata = Metadata.manualEntry(
-                        clientRecordId = "aw9_steps_${stepWindowStamp}_$stepDelta"
-                    )
+                    metadata = Metadata.manualEntry(clientRecordId = "aw9_steps_${stepWindowStamp}_$stepDelta")
                 )
             )
         }
@@ -336,11 +338,41 @@ class HealthConnectManager(context: Context) {
         val hc = client ?: return 0
         if (records.isEmpty()) return 0
         var totalInserted = 0
-        splitIntoBatches(records).forEach { chunk ->
-            totalInserted += insertAndCount(hc, chunk)
+        var failedChunks = 0
+        // Per-chunk try/catch: the first exception used to propagate out of the loop, so
+        // every later chunk was never attempted and the already-committed count was lost
+        // with the exception — a 5,000-record import failing on chunk 3 left 1,000 records
+        // in Health Connect while the UI reported a total failure and no count.
+        splitIntoBatches(records).forEachIndexed { index, chunk ->
+            try {
+                totalInserted += insertAndCount(hc, chunk)
+            } catch (e: Exception) {
+                failedChunks += 1
+                if (failedChunks == 1) {
+                    // Report the first failure; a permanent problem would otherwise log
+                    // once per remaining chunk.
+                    lastBatchError = "chunk ${index + 1} failed: ${e.javaClass.simpleName}: ${e.message}"
+                }
+            }
         }
+        // The caller needs to know a partial import happened; exposing it beats returning
+        // a bare count that silently omits the failures.
+        lastFailedChunkCount = failedChunks
         return totalInserted
     }
+
+    /**
+     * Number of chunks that failed during the most recent [insertBatchRecords] call.
+     * Zero means the whole batch was attempted and every chunk was accepted.
+     */
+    @Volatile
+    var lastFailedChunkCount: Int = 0
+        private set
+
+    /** Human-readable description of the first chunk failure, or null. */
+    @Volatile
+    var lastBatchError: String? = null
+        private set
 }
 
 /**

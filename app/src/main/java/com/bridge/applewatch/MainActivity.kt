@@ -204,9 +204,18 @@ class MainActivity : ComponentActivity() {
                     } else {
                         "PARTIAL: ${result.stopReason ?: "document was truncated"}"
                     }
+                    // A mid-batch failure used to be indistinguishable from a total one:
+                    // the caller saw only an exception, so records that had actually been
+                    // committed were reported as none.
+                    val chunkFailures = healthManager.lastFailedChunkCount
+                    val failureNote = if (chunkFailures > 0) {
+                        " — $chunkFailures chunk(s) failed: ${healthManager.lastBatchError}"
+                    } else {
+                        ""
+                    }
                     WatchBridgeService.appendExternalLog(
                         "Imported $inserted of ${result.records.size} parsed Apple Health " +
-                            "XML records ($completeness)",
+                            "XML records ($completeness)$failureNote",
                         xmlCountDelta = inserted
                     )
                 }

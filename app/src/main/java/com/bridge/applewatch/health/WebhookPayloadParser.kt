@@ -415,15 +415,38 @@ object WebhookPayloadParser {
     }
 
     private fun longOf(json: JSONObject, key: String, fallback: Long): Long =
-        numeric(json.opt(key))?.toLong() ?: fallback
+        plausibleLong(numeric(json.opt(key))) ?: fallback
 
     private fun longOfAny(json: JSONObject, fallback: Long, vararg keys: String): Long {
         for (key in keys) {
-            val v = numeric(json.opt(key))?.toLong()
+            val v = plausibleLong(numeric(json.opt(key)))
             if (v != null) return v
         }
         return fallback
     }
+
+    /**
+     * Converts a numeric JSON value to a `Long`, rejecting implausible magnitudes instead
+     * of inheriting `toLong()`'s **saturation**.
+     *
+     * `Double.toLong()` clamps rather than wrapping, so a finite-but-oversized value such
+     * as `1e300` becomes `Long.MAX_VALUE`. That is not just a bad reading: the step
+     * baseline treats any larger cumulative value as the new baseline, so one such payload
+     * would set it to `Long.MAX_VALUE`, persist it, and make **every subsequent step delta
+     * zero for the rest of the day** — the same harm the non-finite guard exists to
+     * prevent, reached through a finite value.
+     */
+    private fun plausibleLong(value: Number?): Long? {
+        val asDouble = value?.toDouble() ?: return null
+        if (asDouble < -MAX_PLAUSIBLE_COUNT || asDouble > MAX_PLAUSIBLE_COUNT) return null
+        return asDouble.toLong()
+    }
+
+    /**
+     * Upper bound for any cumulative count this bridge accepts (steps, sleep minutes).
+     * Far above a real day, far below `Long` saturation.
+     */
+    private const val MAX_PLAUSIBLE_COUNT = 10_000_000.0
 
     /**
      * Shortcuts' "Get Contents of URL" often stringifies numbers, so a quoted
@@ -432,10 +455,8 @@ object WebhookPayloadParser {
      *
      * **Non-finite values are rejected.** `toDoubleOrNull("1e999")` returns `Infinity`,
      * which passes every `> 0.0` gate downstream and would construct an infinite
-     * `Length.meters(...)`/`Energy.kilocalories(...)` record; worse, `Infinity.toLong()`
-     * saturates to `Long.MAX_VALUE`, which poisons the persisted step baseline so that
-     * every subsequent step delta becomes 0. `NaN` is already excluded by the
-     * `isNaN()`/range checks, but `Infinity` is not, so it is filtered here.
+     * `Length.meters(...)`/`Energy.kilocalories(...)` record. `NaN` is already excluded by
+     * the `isNaN()`/range checks, but `Infinity` is not, so it is filtered here.
      */
     private fun numeric(value: Any?): Number? = when (value) {
         null, JSONObject.NULL -> null

@@ -435,6 +435,22 @@ class WebhookPayloadParserTest {
     }
 
     @Test
+    fun `a finite but oversized count is rejected instead of saturating`() {
+        // `Double.toLong()` clamps rather than wraps, so 1e300 became Long.MAX_VALUE. The
+        // step baseline treats any larger cumulative value as the new baseline, so one
+        // such payload would set it to Long.MAX_VALUE, persist it, and make every later
+        // step delta zero for the rest of the day — the same harm as an Infinity, reached
+        // through a finite value.
+        val expected = WebhookTelemetryPayload()
+        assertEquals(expected, WebhookPayloadParser.parse("""{"steps":1e300}"""))
+        assertEquals(expected, WebhookPayloadParser.parse("""{"steps":"1e300"}"""))
+        assertEquals(expected, WebhookPayloadParser.parse("""{"sleepMinutes":1e300}"""))
+
+        // A genuinely large but plausible day still passes.
+        assertEquals(100_000L, WebhookPayloadParser.parse("""{"steps":100000}""").steps)
+    }
+
+    @Test
     fun `sleep analysis durations are hours and are converted to minutes`() {
         // Health Auto Export documents sleep_analysis with units "hr"; reading it as
         // minutes turned a 7.5-hour night into a 7-minute session.
