@@ -19,6 +19,10 @@ import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.time.LocalDate
+import java.util.Collections
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * Robolectric coverage for the Android-framework surface of WatchBridgeService:
@@ -195,7 +199,7 @@ class WatchBridgeServiceTest {
 
         attempt("OPTIONS preflight") {
             val response = rawRequest("OPTIONS /telemetry HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertNotNull("no response (last error: ${socketError.get()})", response)
             assertTrue("expected 204, got: $response", response!!.startsWith("HTTP/1.1 204"))
             assertTrue(
                 "preflight must advertise the token header",
@@ -213,7 +217,7 @@ class WatchBridgeServiceTest {
 
         attempt("token gate") {
             val refused = rawRequest("GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            assertNotNull("no response (last error: $lastSocketError)", refused)
+            assertNotNull("no response (last error: ${socketError.get()})", refused)
             assertTrue("expected 401, got: $refused", refused!!.startsWith("HTTP/1.1 401"))
             // 401 responses must carry the CORS headers too, or a browser client cannot
             // read the rejection and retry with a token.
@@ -227,7 +231,7 @@ class WatchBridgeServiceTest {
             val allowed = rawRequest(
                 "GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Bridge-Token: required-secret\r\n\r\n"
             )
-            assertNotNull("no response (last error: $lastSocketError)", allowed)
+            assertNotNull("no response (last error: ${socketError.get()})", allowed)
             assertTrue("expected 200, got: $allowed", allowed!!.startsWith("HTTP/1.1 200"))
             assertTrue(allowed.contains("\"status\":\"online\""))
         }
@@ -243,7 +247,7 @@ class WatchBridgeServiceTest {
         """.trimIndent()
         attempt("Shortcuts body") {
             val response = postTelemetry(body)
-            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertNotNull("no response (last error: ${socketError.get()})", response)
             assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
         }
 
@@ -263,7 +267,7 @@ class WatchBridgeServiceTest {
              {"name":"step_count","units":"count","data":[{"qty":400},{"qty":350}]}]}}"""
         attempt("Health Auto Export body") {
             val response = postTelemetry(body)
-            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertNotNull("no response (last error: ${socketError.get()})", response)
             assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
         }
 
@@ -276,7 +280,7 @@ class WatchBridgeServiceTest {
     fun `a malformed body is answered and leaves the known state intact`() {
         attempt("well-formed body") {
             val response = postTelemetry("""{"heart_rate":71}""")
-            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertNotNull("no response (last error: ${socketError.get()})", response)
         }
         assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
 
@@ -284,10 +288,69 @@ class WatchBridgeServiceTest {
         // escape the connection, so the client still gets a response.
         attempt("malformed body") {
             val response = postTelemetry("{definitely not json")
-            assertNotNull("malformed body must still be answered (last error: $lastSocketError)", response)
+            assertNotNull("malformed body must still be answered (last error: ${socketError.get()})", response)
             assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
         }
         assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
+    }
+
+    @Test
+    fun `concurrent telemetry posts are all served under the concurrency limit`() {
+        // Start the listener before any worker thread touches shared state.
+        startBridgeIfNeeded()
+
+        // Well above the 8-permit cap, so requests genuinely contend for a permit
+        // rather than trickling through one at a time.
+        val requestCount = WatchBridgeService.HTTP_MAX_CONCURRENCY * 3
+        val failures = Collections.synchronizedList(mutableListOf<String>())
+        val statuses = Collections.synchronizedList(mutableListOf<String>())
+        val startGate = CountDownLatch(1)
+        val executor = Executors.newFixedThreadPool(requestCount)
+
+        try {
+            val futures = (1..requestCount).map { index ->
+                executor.submit {
+                    // Hold every worker at the gate so the burst is genuinely concurrent.
+                    startGate.await(10, TimeUnit.SECONDS)
+                    val response = try {
+                        rawRequest(
+                            "POST /telemetry HTTP/1.1\r\n" +
+                                "Host: 127.0.0.1\r\n" +
+                                "Content-Type: application/json\r\n" +
+                                "Content-Length: ${"""{"heart_rate":$index}""".toByteArray().size}\r\n" +
+                                "\r\n" +
+                                """{"heart_rate":$index}"""
+                        )
+                    } catch (e: Exception) {
+                        failures.add("request $index threw ${e.javaClass.simpleName}: ${e.message}")
+                        return@submit
+                    }
+                    if (response == null) {
+                        failures.add("request $index got no response (last: ${socketError.get()})")
+                        return@submit
+                    }
+                    val status = response.lineSequence().firstOrNull() ?: "<empty>"
+                    statuses.add(status)
+                    if (!status.startsWith("HTTP/1.1 200")) {
+                        failures.add("request $index -> $status")
+                    }
+                }
+            }
+            startGate.countDown()
+            futures.forEach { it.get(60, TimeUnit.SECONDS) }
+        } finally {
+            executor.shutdownNow()
+        }
+
+        assertEquals(
+            "every concurrent request must be served; failures: $failures",
+            0,
+            failures.size
+        )
+        assertEquals(requestCount, statuses.size)
+        // The healthy path must never be the overload path: a 503 here would mean the
+        // permit wait is too short for a burst this size.
+        assertFalse("no request may be refused while capacity exists", statuses.any { it.contains("503") })
     }
 
     /**
@@ -385,7 +448,7 @@ class WatchBridgeServiceTest {
         return try {
             rawRequestOnce(port, request)
         } catch (e: Exception) {
-            lastSocketError = "${e.javaClass.name}: ${e.message}"
+            socketError.set("${e.javaClass.name}: ${e.message}")
             null
         }
     }
@@ -427,7 +490,11 @@ class WatchBridgeServiceTest {
         }
     }
 
-    private var lastSocketError: String = "none"
+    /**
+     * Last socket error for *this* thread. Thread-local because the concurrency test
+     * drives the same helper from many worker threads at once.
+     */
+    private val socketError = ThreadLocal.withInitial { "none" }
 
     private fun persistedBaseline(): Long =
         WatchBridgeService.loadPersistedStepBaseline(context, LocalDate.now().toEpochDay())
