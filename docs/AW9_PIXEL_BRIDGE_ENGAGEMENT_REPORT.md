@@ -40,6 +40,7 @@ Three releases were shipped, all built and verified by CI:
 | v1.0.2 | Token, bounded reconnect, D-07/D-07b/D-09, watchOS CI | 32 | 510,151 | 25 | 0 errors / 12 warnings |
 | v1.1.0 | Closure of all ten open items (OPEN-01…OPEN-10) | 41 | 732,814 | 58 | 0 errors / 14 warnings |
 | v1.2.0 | Four hardening PRs, PRs opened and CI-verified before merge | 44 | 1,056,310 | 84 | 0 errors / 14 warnings |
+| v1.2.1 | Audit remediation: 45 findings from three independent audits | 48 | 1,149,337 | 113 | 0 errors / 13 warnings |
 
 > The v1.0.0 and v1.0.1 byte totals in this table are the originally published ones; the
 > measured values differ (238,044 and 464,707) — see §12.3 for the reconciliation.
@@ -634,4 +635,147 @@ Unchanged from §12.5 and worth repeating because none of it was addressed by th
 **no physical device**, no rendered UI, and no signed or installed watch app. The 84 tests
 are still JVM/Robolectric tests. Everything about real radios, real Health Connect, and a
 real Apple Watch posting over a real hotspot remains unverified.
+
+---
+
+## 14. `v1.2.1` — the audit round
+
+### 14.1 Method
+
+Previous rounds relied on my own reading plus CI. For this round I deliberately did not:
+**three independent adversarial read-only audits** were commissioned, each with a
+disjoint scope and an explicit instruction to build a concrete trigger for every finding
+or drop it.
+
+| Auditor | Scope |
+|---|---|
+| A | Android runtime: service, policy, activity, BLE parser, control dispatcher, manifest |
+| B | Health-data layer: `HealthConnectManager`, XML importer, webhook parser, build config |
+| C | watchOS: Swift, XcodeGen spec, `Info.plist`, CI workflow |
+
+They produced **45 findings**. Crucially, they **converged independently**: the step
+record-id collision was found by A and B separately; the SDNN/RMSSD mislabelling by A, B
+and C. Independent agreement on the same defect is much stronger evidence than a single
+reviewer's opinion, so those were treated as established fact and fixed first.
+
+This is the fifth consecutive round in which the highest-value work came from something
+*other* than reading the code: a real compiler (§3), a real CI runner (§12.4), and now
+adversarial readers who were told to attack it.
+
+### 14.2 The two most serious defects were both silent
+
+Neither crashed, neither failed a test, and both had been shipped for three releases.
+
+1. **A fabricated 30 bpm heart-rate record.** `valueStr.toDoubleOrNull() ?: 0.0`
+   followed by `coerceIn(30L, 240L)` meant a `<Record>` with a *missing* or
+   non-numeric `value` attribute was written to Health Connect as a **30 bpm reading**,
+   and a genuine out-of-range artefact (15 or 290 bpm) was silently rewritten into a
+   plausible one. This is the same class of defect as the hardcoded `spo2 = 98.0` fixed
+   in v1.0.1 — in a code path that had never been audited. Missing, unparseable and
+   out-of-range values are now **skipped**; the importer no longer substitutes values at
+   all.
+2. **A 2 GB allocation driven by one request header.** The request body buffer was sized
+   from the client-supplied `Content-Length` *before any body byte was read*, so
+   `Content-Length: 2000000000` allocated ~4 GB and killed the process — and
+   `OutOfMemoryError` is an `Error`, so the handler's `catch (e: Exception)` never saw
+   it, and the service restarted to be attacked again. Bodies are now capped at 256 KiB
+   and refused with `413` before allocation; header blocks are bounded and refused
+   with `431`.
+
+### 14.3 Data loss
+
+| Defect | Effect |
+|---|---|
+| Step deltas shared one hour-stable `clientRecordId` with `clientRecordVersion = 0` | Health Connect upserts by that id, so **every delta in an hour overwrote the previous one** — an hour could never accumulate its steps |
+| The watch sent a *per-workout* step count to a phone that treats steps as a monotonic daily counter | Every step after a workout restart was discarded until the new session passed the old total |
+| The in-memory step baseline was only re-established in `onCreate` | A service running overnight kept yesterday's baseline and **swallowed the new day's steps**, often until the afternoon |
+| `Health Auto Export` `sleep_analysis` durations are **hours**; they were read as minutes | A 7.5-hour night was written as a **7-minute** sleep session |
+| The HR sample buffer was drained *before* the flush | When Health Connect was unavailable (`client == null` returns 0 without throwing) every 15 s of samples was discarded, forever, with no log line |
+| A truncated `export.xml` threw out of the whole scan | One bad byte in a multi-hundred-megabyte export lost **every** record, including those already parsed |
+| Record ids ignored the source | Apple's export contains overlapping iPhone and Watch records at second granularity, so they either collapsed into one or were double-counted |
+
+### 14.4 Mislabelled clinical data
+
+- **SDNN written as RMSSD.** `D-05` had gated SDNN in the XML importer only; the two JSON
+  paths and the watch **all** wrote Apple's SDNN numbers into
+  `HeartRateVariabilityRmssdRecord`, which stores RMSSD. Three auditors found this
+  independently. SDNN-named keys are now rejected everywhere and the watch no longer
+  sends `hrvMs`.
+- **Producer units ignored.** `walking_running_distance` was assumed to be kilometres and
+  everything else metres or kilocalories, so a `mi`/`kJ` payload (Health Auto Export's
+  units are per-metric user preferences) was written with wrong magnitudes. Every string
+  path and the XML importer now convert from the stated unit and **skip** unknown ones.
+- **Apple's UTC offset was discarded** and re-derived from the phone's zone, mislabelling
+  the local time of every record from an export recorded elsewhere.
+
+### 14.5 A defect the earlier audits did not reach: platform ceilings
+
+Probing the resolved `connect-client:1.1.0` artifact showed that Health Connect's own
+record constructors **throw** above certain limits:
+
+```text
+HeartRateVariabilityRmssdRecord  > 200.0 ms          -> IllegalArgumentException
+StepsRecord                      > 1000000           -> IllegalArgumentException
+DistanceRecord                   > 1000000.0 meters  -> IllegalArgumentException
+ActiveCaloriesBurnedRecord       > 1000000.0 kcal    -> IllegalArgumentException
+FloorsClimbedRecord              > 1000000.0         -> IllegalArgumentException
+```
+
+The app's gates allowed `hrvMs` up to 250 and had **no** upper bound on steps, distance,
+energy or floors. Because the throw happens while *building* the batch, a single
+over-limit value rejected the entire `insertRecords` call and **lost every valid record
+alongside it**. All gates now match the platform, and a test proves that one bad metric
+no longer takes its neighbours with it.
+
+### 14.6 Everything else closed
+
+Non-finite values (`"1e999"` → `Infinity`) passing every `> 0.0` gate, and `Infinity`
+saturating to `Long.MAX_VALUE` to poison the persisted step baseline · `sleepMinutes`
+overflow making a session end before it started · a leaked `BluetoothGatt` client per
+disconnect · the GATT operation queue advanced from three unsynchronised contexts ·
+telemetry state mutated with non-atomic read-modify-write from five contexts ·
+the "bounded retry" bypassed by the low-latency scan · a second-granular HRV record id
+(`D-07` applied elsewhere) · camera-shutter reporting success whenever `sendBroadcast`
+did not throw (it never throws with no receiver) · the auth badge reading the service's
+static token, so it claimed "No Token Set" for a persisted token · the bridge token
+included in Android Auto Backup · alarms stacking without bound · a second
+`HKWorkoutSession` that could be started and never stopped · control buttons POSTing to
+`/telemetry`, which **re-committed stale telemetry as fresh records** on every press ·
+and the missing HealthKit **entitlement** (only the usage strings were present).
+
+### 14.7 Test honesty
+
+The auditors' sharpest finding was about my own tests: **the manager's ten sentinel
+gates had zero coverage.** They were reachable only through a live Health Connect client,
+which a JVM test cannot construct — so *deleting all ten guards kept the suite green*.
+The contract the parser tests claimed was enforced "downstream" was enforced nowhere.
+
+`buildTelemetryRecords()` is now a pure, internal function and every boundary is pinned
+(30/240 bpm, 70/100 SpO₂, 1/200 ms HRV, 30/150 resting HR, 4/60 respiration, sleep and
+step bounds, platform ceilings). Two further test defects were fixed: the XML importer
+tests had been exercising **stubbed** Android XML — `Xml.newPullParser()` and
+`XmlPullParserFactory.newInstance()` both return defaults in the JVM runtime, so those
+tests observed zero records and passed for the wrong reason — and the record-id test was
+a tautology that asserted two literals the test itself had written differ.
+
+Test count **84 → 113**. Lint 0 errors. Both CI jobs green, including XcodeGen
+generation, the Swift type-check and `xcodebuild` — now on `macos-15`, because
+`macos-14` was retired on 2026-11-02 and every job pinned to it would have failed at
+scheduling, silently removing the entire watchOS gate.
+
+### 14.8 Two deliberate, documented non-fixes
+
+- **Releases remain signed with the Android debug key.** This is the project's
+  documented choice so CI artifacts are immediately sideloadable. It is a real tradeoff
+  — anyone can re-sign them, and they cannot upgrade a properly-signed install — but it
+  is a product decision, not an oversight, and the owner chose to keep it.
+- **`docs/GEMINI_REVIEW_PACKET_Give.md` was never committed.** It is byte-identical
+  (SHA-256 `38C82206…`) to the tracked `docs/GEMINI_REVIEW_PACKET.md`; committing it
+  would add a duplicate 159 KB document. It has now been deleted from the working tree.
+
+### 14.9 Limits, unchanged
+
+The APK has **still never run on a physical device**. Nothing here was validated against
+a real radio, a real Health Connect provider, or a real Apple Watch. 113 tests prove the
+code compiles, lints, and behaves under test — not that it works on hardware.
 
