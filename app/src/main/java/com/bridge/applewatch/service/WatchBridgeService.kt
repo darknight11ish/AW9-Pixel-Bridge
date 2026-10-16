@@ -79,10 +79,16 @@ class WatchBridgeService : Service() {
 
         /**
          * How long a request may wait for a concurrency permit before it is refused with
-         * `503`. Above the read timeout on purpose: a request that has to wait longer
-         * than a slow peer is allowed to hold its socket has already lost.
+         * `503`.
+         *
+         * Deliberately *shorter* than the read timeout, not longer. While the two were
+         * both ~6 s, the last request in a burst could still be waiting when its client
+         * gave up, so a saturated-but-healthy server produced client-visible timeouts
+         * instead of a clean `503`. A 2 s wait bounds total request latency to
+         * permit-wait + handler time, well inside the 5 s client read timeout, and still
+         * absorbs a normal burst.
          */
-        private const val HTTP_PERMIT_WAIT_MS = 6_000
+        private const val HTTP_PERMIT_WAIT_MS = 2_000
 
         /** Poll interval while waiting for an HTTP concurrency permit. */
         private const val PERMIT_POLL_INTERVAL_MS = 25L

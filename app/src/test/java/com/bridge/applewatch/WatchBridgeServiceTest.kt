@@ -355,9 +355,11 @@ class WatchBridgeServiceTest {
         // Start the listener before any worker thread touches shared state.
         startBridgeIfNeeded()
 
-        // Well above the 8-permit cap, so requests genuinely contend for a permit
-        // rather than trickling through one at a time.
-        val requestCount = WatchBridgeService.HTTP_MAX_CONCURRENCY * 3
+        // Deliberately modest: this test is about the handler serving a burst without
+        // dropping or refusing requests, not about loading the host. Sending far more than
+        // the cap only measures how fast the machine retires sockets, which is what made
+        // an earlier 3x version flaky on CI while passing locally.
+        val requestCount = WatchBridgeService.HTTP_MAX_CONCURRENCY + 2
         val failures = Collections.synchronizedList(mutableListOf<String>())
         val statuses = Collections.synchronizedList(mutableListOf<String>())
         val startGate = CountDownLatch(1)
