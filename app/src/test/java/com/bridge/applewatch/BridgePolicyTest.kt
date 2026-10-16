@@ -152,4 +152,94 @@ class BridgePolicyTest {
         assertFalse(BridgePolicy.tokenAccepted("s3cret", null))
         assertFalse(BridgePolicy.tokenAccepted("s3cret", ""))
     }
+
+    // ------------------------------- webhook endpoint ranking (OPEN-06) -------------
+
+    @Test
+    fun `hotspot interface outranks primary wifi`() {
+        // The Pixel hotspot gateway the watch actually has to reach.
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_HOTSPOT,
+            BridgePolicy.classifyInterfacePriority("ap0", "192.168.43.1")
+        )
+        // SoftAP/tethering names beyond plain "ap".
+        listOf("softap0", "swlan0", "wlan1", "rndis0").forEach { name ->
+            assertEquals(
+                "$name must rank as hotspot",
+                BridgePolicy.ENDPOINT_PRIORITY_HOTSPOT,
+                BridgePolicy.classifyInterfacePriority(name, "10.0.0.2")
+            )
+        }
+        // Vendor naming varies, so the gateway range is matched too.
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_HOTSPOT,
+            BridgePolicy.classifyInterfacePriority("wlan9", "192.168.43.1")
+        )
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_HOTSPOT,
+            BridgePolicy.classifyInterfacePriority("wlan9", "192.168.49.1")
+        )
+
+        // 192.168.1.x is an ordinary router LAN, not this phone's hotspot.
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_WIFI,
+            BridgePolicy.classifyInterfacePriority("wlan0", "192.168.1.25")
+        )
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_WIFI,
+            BridgePolicy.classifyInterfacePriority("en0", "10.1.2.3")
+        )
+        assertEquals(
+            BridgePolicy.ENDPOINT_PRIORITY_OTHER,
+            BridgePolicy.classifyInterfacePriority("rmnet0", "172.20.10.1")
+        )
+    }
+
+    @Test
+    fun `ap0 sorts ahead of wlan0 and both urls are formatted`() {
+        val candidates = listOf(
+            "wlan0" to "192.168.1.25",
+            "ap0" to "192.168.43.1"
+        )
+
+        val formatted = BridgePolicy.sortAndFormatEndpoints(candidates)
+        val lines = formatted.split("\n")
+        assertEquals(2, lines.size)
+        assertEquals("Hotspot (ap0): http://192.168.43.1:8484/telemetry", lines[0])
+        assertEquals("Wi-Fi (wlan0): http://192.168.1.25:8484/telemetry", lines[1])
+
+        // Order must not depend on the order the interfaces happened to be enumerated in.
+        val reversed = BridgePolicy.sortAndFormatEndpoints(candidates.reversed())
+        assertEquals(formatted, reversed)
+    }
+
+    @Test
+    fun `only private addresses are offered as webhook endpoints`() {
+        // A public address is either a carrier interface or a measurement error; the
+        // watch could never reach it over the private-LAN bridge anyway.
+        val formatted = BridgePolicy.sortAndFormatEndpoints(
+            listOf("rmnet0" to "100.64.1.5", "wlan0" to "8.8.8.8", "ap0" to "192.168.43.1")
+        )
+        assertEquals("Hotspot (ap0): http://192.168.43.1:8484/telemetry", formatted)
+    }
+
+    @Test
+    fun `an interface with no usable address falls back to an explanatory loopback url`() {
+        val expected = "http://127.0.0.1:8484/telemetry (Enable Wi-Fi or 2.4GHz Hotspot)"
+        assertEquals(expected, BridgePolicy.sortAndFormatEndpoints(emptyList()))
+        assertEquals(expected, BridgePolicy.sortAndFormatEndpoints(listOf("wlan0" to "")))
+        // A non-default port must be reflected rather than hardcoded.
+        assertEquals(
+            "Hotspot (ap0): http://192.168.43.1:9999/telemetry",
+            BridgePolicy.sortAndFormatEndpoints(listOf("ap0" to "192.168.43.1"), port = 9999)
+        )
+    }
+
+    @Test
+    fun `duplicate addresses are reported once`() {
+        val formatted = BridgePolicy.sortAndFormatEndpoints(
+            listOf("wlan0" to "192.168.1.5", "wlan1" to "192.168.1.5")
+        )
+        assertEquals(1, formatted.split("\n").size)
+    }
 }
