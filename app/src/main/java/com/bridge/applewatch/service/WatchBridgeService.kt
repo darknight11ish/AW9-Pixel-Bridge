@@ -79,10 +79,16 @@ class WatchBridgeService : Service() {
 
         /**
          * How long a request may wait for a concurrency permit before it is refused with
-         * `503`. Above the read timeout on purpose: a request that has to wait longer
-         * than a slow peer is allowed to hold its socket has already lost.
+         * `503`.
+         *
+         * Deliberately *shorter* than the read timeout, not longer. While the two were
+         * both ~6 s, the last request in a burst could still be waiting when its client
+         * gave up, so a saturated-but-healthy server produced client-visible timeouts
+         * instead of a clean `503`. A 2 s wait bounds total request latency to
+         * permit-wait + handler time, well inside the 5 s client read timeout, and still
+         * absorbs a normal burst.
          */
-        private const val HTTP_PERMIT_WAIT_MS = 6_000
+        private const val HTTP_PERMIT_WAIT_MS = 2_000
 
         /** Poll interval while waiting for an HTTP concurrency permit. */
         private const val PERMIT_POLL_INTERVAL_MS = 25L
@@ -1054,9 +1060,16 @@ class WatchBridgeService : Service() {
                 _telemetry.update { current -> current.copy(lastControlAction = res) }
             }
 
-            // Read-compute-persist under one lock: with up to 8 handlers in flight, two
-            // webhooks could otherwise both advance the baseline from the same stale
-            // value, dropping or double-counting a delta.
+            // Read-compute under one lock: with up to 8 handlers in flight, two webhooks
+            // could otherwise both advance the baseline from the same stale value,
+            // dropping or double-counting a delta.
+            //
+            // The baseline is NOT committed here. It used to be advanced *and persisted*
+            // before the Health Connect write, so if that write did nothing — Health
+            // Connect absent returns 0 without throwing — the delta was already consumed.
+            // Steps accrued during the outage were then unrecoverable, and because the
+            // baseline was persisted, a restart could not recover them either. The
+            // advance is prepared here and committed only once records were written.
             val advance = synchronized(stepBaselineLock) {
                 val today = LocalDate.now().toEpochDay()
                 if (baselineEpochDay != today) {
@@ -1067,18 +1080,30 @@ class WatchBridgeService : Service() {
                     lastCumulativeSteps = BridgePolicy.NO_STEP_BASELINE
                     baselineEpochDay = today
                 }
-                val advanced = BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
-                if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
-                    advanced.baseline != BridgePolicy.NO_STEP_BASELINE
-                ) {
-                    logEvent("Step baseline established at ${advanced.baseline}")
-                }
-                lastCumulativeSteps = advanced.baseline
-                persistStepBaseline(this, advanced.baseline, today)
-                advanced
+                BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
             }
 
             val writtenCount = healthManager.writeTelemetryPayload(payload, advance.delta)
+
+            if (advance.delta > 0 && writtenCount <= 0) {
+                // Health Connect accepted nothing, so do not consume the delta: keep the
+                // previous baseline and say so, rather than losing the steps silently.
+                logEvent(
+                    "Health Connect unavailable — retaining ${advance.delta} step(s) for retry"
+                )
+            } else {
+                synchronized(stepBaselineLock) {
+                    val today = LocalDate.now().toEpochDay()
+                    if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
+                        advance.baseline != BridgePolicy.NO_STEP_BASELINE
+                    ) {
+                        logEvent("Step baseline established at ${advance.baseline}")
+                    }
+                    lastCumulativeSteps = advance.baseline
+                    baselineEpochDay = today
+                    persistStepBaseline(this, advance.baseline, today)
+                }
+            }
 
             _telemetry.update { cur ->
                 cur.copy(

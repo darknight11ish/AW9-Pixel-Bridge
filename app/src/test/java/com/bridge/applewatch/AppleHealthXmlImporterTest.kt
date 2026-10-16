@@ -210,6 +210,28 @@ class AppleHealthXmlImporterTest {
         )
     }
 
+    @Test
+    fun `an over-limit value is skipped rather than throwing and ending the scan`() {
+        // Health Connect's constructors reject these magnitudes. Because they throw while
+        // the record is being built *inside* the scan, an over-limit node used to be caught
+        // by parseRecords' handler and abandon the remainder of the file.
+        assertNull(
+            "steps above 1e6 exceed Health Connect's ceiling",
+            map("HKQuantityTypeIdentifierStepCount", "2000000")
+        )
+        assertNull(
+            "1000 miles is over the distance ceiling once converted",
+            map("HKQuantityTypeIdentifierDistanceWalkingRunning", "1000", unit = "mi")
+        )
+        assertNull(
+            "energy above 1e6 kcal exceeds the ceiling",
+            map("HKQuantityTypeIdentifierActiveEnergyBurned", "2000000", unit = "kcal")
+        )
+
+        // The boundary itself is still importable.
+        assertTrue(map("HKQuantityTypeIdentifierStepCount", "1000000") is StepsRecord)
+    }
+
     // -------------------------------------------------------------- SDNN gate
 
     @Test

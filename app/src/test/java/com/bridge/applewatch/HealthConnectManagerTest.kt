@@ -318,7 +318,7 @@ class HealthConnectManagerTest {
     }
 
     @Test
-    fun `hrv is gated to the 1 to 250 range`() {
+    fun `hrv is gated to the 1 to 200 range, matching the platform ceiling`() {
         fun records(hrv: Double) = HealthConnectManager(context)
             .buildTelemetryRecords(WebhookTelemetryPayload(hrvMs = hrv), 0L, now)
             .filterIsInstance<HeartRateVariabilityRmssdRecord>()
