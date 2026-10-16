@@ -25,9 +25,9 @@ options:
   # (the Xcode 16 format), which Xcode 15 refuses to open at all:
   #   "cannot be opened because it is in a future Xcode project file format (77)"
   # Measured on the macos-14 runner: neither `objectVersion` nor `compatibilityVersion`
-  # under `options` changes the emitted value, so CI pins the XcodeGen *version*
-  # instead (see .github/workflows/android-ci.yml). Generate with XcodeGen 2.43.0, or
-  # with any Xcode 16+ install, to get a project your Xcode can read.
+  # under `options` changes the emitted value. CI has since moved to macos-15, whose
+  # Xcode 16.4 reads 77 natively, so no version is pinned any more — but on Xcode 15,
+  # generate with XcodeGen 2.43.0 instead, or open the project in Xcode 16+.
   compatibilityVersion: "Xcode 14.0"
 
 targets:

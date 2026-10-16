@@ -89,30 +89,22 @@ jobs:
           swift --version
           xcrun --sdk watchos --show-sdk-path
 
-      - name: Install XcodeGen 2.43.0
+      - name: Install XcodeGen
         # XcodeGen is deliberately installed rather than probed with
         # `command -v xcodegen`: it is not present on the macos runner images, so a
         # guarded step would silently pass forever and never verify project.yml.
         #
-        # The version is PINNED to 2.43.0 on purpose, from the official release asset.
-        # Measured on the runner: XcodeGen 2.44+ emits `objectVersion 77`, the Xcode 16
-        # project format, which this image's Xcode 15.4 refuses to open at all
-        # ("cannot be opened because it is in a future Xcode project file format (77)").
-        # Neither `options.objectVersion` nor `options.compatibilityVersion` in
-        # project.yml changes the emitted value, so the supported lever is the generator
-        # version. 2.43.0 emits the older format that Xcode 15 and 16 both read.
+        # This installs Homebrew's *current* XcodeGen on purpose. The pin to 2.43.0
+        # existed only because 2.44+ emits `objectVersion 77`, the Xcode 16 project
+        # format, which the macos-14 image's Xcode 15.4 refused to open. The job now runs
+        # on macos-15 with Xcode 16.4, which reads 77 natively, so the pin is no longer
+        # required — and dropping it removes a dependency on one specific old release
+        # asset. The next step still reads the emitted objectVersion back and fails with
+        # a clear message if it is ever too new for the runner's Xcode.
         run: |
           set -o pipefail
-          curl -fsSL -o /tmp/xcodegen.zip \
-            https://github.com/yonaskolb/XcodeGen/releases/download/2.43.0/xcodegen.zip
-          unzip -q -o /tmp/xcodegen.zip -d /tmp/xcodegen
-          XCODEGEN_BIN="$(find /tmp/xcodegen -type f -name xcodegen -perm -u+x | head -n 1)"
-          if [ -z "$XCODEGEN_BIN" ]; then
-            echo "::error::xcodegen binary not found in the release archive"
-            exit 1
-          fi
-          echo "$(dirname "$XCODEGEN_BIN")" >> "$GITHUB_PATH"
-          "$XCODEGEN_BIN" --version
+          brew install xcodegen
+          xcodegen --version
 
       - name: Generate the watchOS Xcode project from project.yml
         run: |
