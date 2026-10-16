@@ -473,21 +473,28 @@ the review documents are reproducible") was worth doing.
 
 ### 12.4 What CI proved, and the three bugs it found that local runs did not
 
-The v1.1.0 push ran the real workflow. **Both jobs are green** (run
-[`38875213993`](https://github.com/darknight11ish/AW9-Pixel-Bridge/actions/runs/38875213993)):
+The v1.1.0 push ran the real workflow. **Both jobs are green, on three consecutive
+runs** ([`38875985814`](https://github.com/darknight11ish/AW9-Pixel-Bridge/actions/runs/38875985814),
+[`38876269755`](https://github.com/darknight11ish/AW9-Pixel-Bridge/actions/runs/38876269755),
+[`38876650657`](https://github.com/darknight11ish/AW9-Pixel-Bridge/actions/runs/38876650657)):
 `build-and-test` passed the JUnit suite, Android Lint, and both APK assemblies, and
 `watchos-companion-typecheck` installed XcodeGen, generated the project, type-checked the
-Swift against the watchOS SDK, and built the generated project with `xcodebuild`.
+Swift against the watchOS SDK, and built the generated project with `xcodebuild`. The
+three-run confirmation exists because the first defect below was intermittent, and a
+single green run would not have proven it fixed.
 
-Getting there took three iterations, and every fix came from CI rather than from local
+Getting there took four iterations, and every fix came from CI rather than from local
 runs:
 
 1. **The HTTP test helper depended on connection-close timing.** It read the response
    with `BufferedReader.readText()`, which only returns when the server closes the
    socket. That passed repeatedly on the Windows host and timed out on the Ubuntu
    runner. The helper now parses the status line and headers and reads exactly
-   `Content-Length` bytes — what an HTTP client should do — and retries connection or
-   read timeouts only, so an incorrect response still fails the assertions.
+   `Content-Length` bytes — what an HTTP client should do. When the failure then moved
+   to *the second request in a test*, the class was restructured to start one listener on
+   an ephemeral port (`startLocalHttpServer(0)`) and reuse it, with the whole client
+   interaction retried a bounded number of times. Assertions stayed strict; only the
+   timing sensitivity was removed.
 2. **The document's XcodeGen guard would have been a permanent silent no-op.** XcodeGen
    is *not* installed on the `macos-14` image (verified against `actions/runner-images`
    `toolset-14.json`, whose `common_packages` does not list it), so the specified
@@ -503,9 +510,11 @@ runs:
    official release asset, and the step reads the generated `objectVersion` back and
    fails explicitly if it is ever too new again.
 
-Two of those (1 and 3) are exactly the class of defect this repository's own process
-notes call out: they were invisible to reading, invisible locally, and only a target
-environment could expose them.
+Defects 1 and 3 are exactly the class of problem this repository's own process notes
+call out: invisible to reading, invisible locally, and only a target environment could
+expose them. Defect 2 is the more interesting one — the specified instruction was itself
+the bug, and following it as written would have produced a check that permanently
+reported success while verifying nothing.
 
 ### 12.5 Honest limits of this verification
 
