@@ -196,21 +196,72 @@ class BridgePolicyTest {
     }
 
     @Test
-    fun `ap0 sorts ahead of wlan0 and both urls are formatted`() {
+    fun `ap0 sorts ahead of wlan0 and both urls are formatted on one line`() {
         val candidates = listOf(
             "wlan0" to "192.168.1.25",
             "ap0" to "192.168.43.1"
         )
 
+        // Both active interfaces are enumerated, hotspot first, separated by " | ".
         val formatted = BridgePolicy.sortAndFormatEndpoints(candidates)
-        val lines = formatted.split("\n")
-        assertEquals(2, lines.size)
-        assertEquals("Hotspot (ap0): http://192.168.43.1:8484/telemetry", lines[0])
-        assertEquals("Wi-Fi (wlan0): http://192.168.1.25:8484/telemetry", lines[1])
+        assertEquals(
+            "Hotspot (ap0): http://192.168.43.1:8484/telemetry" +
+                " | Wi-Fi (wlan0): http://192.168.1.25:8484/telemetry",
+            formatted
+        )
+        // One line: the card renders this as a single monospace row.
+        assertFalse("the endpoint list must not introduce line breaks", formatted.contains("\n"))
 
         // Order must not depend on the order the interfaces happened to be enumerated in.
         val reversed = BridgePolicy.sortAndFormatEndpoints(candidates.reversed())
         assertEquals(formatted, reversed)
+    }
+
+    @Test
+    fun `every active private interface is enumerated and labelled by role`() {
+        val formatted = BridgePolicy.sortAndFormatEndpoints(
+            listOf(
+                "rmnet0" to "172.20.10.4",
+                "wlan0" to "192.168.1.42",
+                "ap0" to "192.168.43.1",
+                "en0" to "10.1.2.3"
+            )
+        )
+        val parts = formatted.split(BridgePolicy.ENDPOINT_SEPARATOR)
+        assertEquals("all four eligible interfaces must be listed", 4, parts.size)
+        // Hotspot, then Wi-Fi/Ethernet by name, then the remaining private LAN.
+        assertEquals("Hotspot (ap0): http://192.168.43.1:8484/telemetry", parts[0])
+        assertEquals("Wi-Fi (en0): http://10.1.2.3:8484/telemetry", parts[1])
+        assertEquals("Wi-Fi (wlan0): http://192.168.1.42:8484/telemetry", parts[2])
+        assertEquals("LAN (rmnet0): http://172.20.10.4:8484/telemetry", parts[3])
+    }
+
+    @Test
+    fun `ranked endpoints preserve priority order and de-duplicate`() {
+        val ranked = BridgePolicy.rankEndpoints(
+            listOf(
+                "wlan0" to "192.168.1.5",
+                "wlan1" to "192.168.1.5",
+                "ap0" to "192.168.43.1"
+            )
+        )
+        assertEquals(listOf("ap0" to "192.168.43.1", "wlan0" to "192.168.1.5"), ranked)
+    }
+
+    @Test
+    fun `a single endpoint is labelled through the same formatter`() {
+        assertEquals(
+            "Hotspot (ap0): http://192.168.43.1:8484/telemetry",
+            BridgePolicy.formatEndpoint("ap0", "192.168.43.1")
+        )
+        assertEquals(
+            "Wi-Fi (wlan0): http://192.168.1.9:9000/telemetry",
+            BridgePolicy.formatEndpoint("wlan0", "192.168.1.9", port = 9000)
+        )
+        assertEquals(
+            "LAN (rmnet0): http://172.20.10.4:8484/telemetry",
+            BridgePolicy.formatEndpoint("rmnet0", "172.20.10.4")
+        )
     }
 
     @Test
@@ -240,6 +291,6 @@ class BridgePolicyTest {
         val formatted = BridgePolicy.sortAndFormatEndpoints(
             listOf("wlan0" to "192.168.1.5", "wlan1" to "192.168.1.5")
         )
-        assertEquals(1, formatted.split("\n").size)
+        assertEquals(1, formatted.split(BridgePolicy.ENDPOINT_SEPARATOR).size)
     }
 }

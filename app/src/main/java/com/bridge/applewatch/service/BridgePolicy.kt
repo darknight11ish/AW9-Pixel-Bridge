@@ -163,18 +163,20 @@ internal object BridgePolicy {
         return ENDPOINT_PRIORITY_OTHER
     }
 
+    /** Separator between endpoints when several interfaces are active. */
+    const val ENDPOINT_SEPARATOR = " | "
+
     /**
-     * Formats every candidate `(interfaceName, ipAddress)` pair into the webhook URLs
-     * to show the user, hotspot first and labelled with its interface (OPEN-06).
+     * Ranks and de-duplicates the candidate `(interfaceName, ipAddress)` pairs into the
+     * order they should be shown, hotspot first.
      *
-     * Multiple interfaces are not an error: the union is shown, because the correct
-     * one depends on which network the watch actually joined. The order is stable for
-     * equal priorities (sorted by interface name, then address), so the display does
-     * not jitter between refreshes. If nothing qualified, the loopback URL is returned
-     * with an instruction, rather than an empty card.
+     * Multiple interfaces are not an error: the union is shown, because the correct one
+     * depends on which network the watch actually joined. Only private addresses qualify,
+     * and a repeated address is reported once. The order is stable for equal priorities
+     * (interface name, then address) so the display does not jitter between refreshes.
      */
-    fun sortAndFormatEndpoints(candidates: List<Pair<String, String>>, port: Int = 8484): String {
-        val ranked = candidates
+    fun rankEndpoints(candidates: List<Pair<String, String>>): List<Pair<String, String>> =
+        candidates
             .filter { (_, ip) -> ip.isNotBlank() && isPrivateNetworkAddress(ip) }
             .distinctBy { (_, ip) -> ip }
             .sortedWith(
@@ -185,17 +187,39 @@ internal object BridgePolicy {
                 )
             )
 
+    /**
+     * Formats a single ranked endpoint as `Label (ifName): http://ip:port/telemetry`.
+     *
+     * The label states the interface's *role* rather than only its name, because the
+     * address alone does not tell the user which one the watch can reach.
+     */
+    fun formatEndpoint(ifName: String, ipAddress: String, port: Int = 8484): String {
+        val label = when (classifyInterfacePriority(ifName, ipAddress)) {
+            ENDPOINT_PRIORITY_HOTSPOT -> "Hotspot ($ifName)"
+            ENDPOINT_PRIORITY_WIFI -> "Wi-Fi ($ifName)"
+            else -> "LAN ($ifName)"
+        }
+        return "$label: http://$ipAddress:$port/telemetry"
+    }
+
+    /**
+     * Formats every candidate `(interfaceName, ipAddress)` pair into the webhook URLs
+     * to show the user, hotspot first, labelled, and separated by [ENDPOINT_SEPARATOR]
+     * (OPEN-06).
+     *
+     * When both Wi-Fi and the phone's own hotspot are up, every eligible address is
+     * enumerated on one line so the user can pick the one their watch can actually
+     * reach, rather than the card showing only whichever interface won a race. If
+     * nothing qualified, the loopback URL is returned with an instruction rather than
+     * leaving the card empty.
+     */
+    fun sortAndFormatEndpoints(candidates: List<Pair<String, String>>, port: Int = 8484): String {
+        val ranked = rankEndpoints(candidates)
         if (ranked.isEmpty()) {
             return "http://127.0.0.1:$port/telemetry (Enable Wi-Fi or 2.4GHz Hotspot)"
         }
-
-        return ranked.joinToString("\n") { (name, ip) ->
-            val label = when (classifyInterfacePriority(name, ip)) {
-                ENDPOINT_PRIORITY_HOTSPOT -> "Hotspot ($name)"
-                ENDPOINT_PRIORITY_WIFI -> "Wi-Fi ($name)"
-                else -> "LAN ($name)"
-            }
-            "$label: http://$ip:$port/telemetry"
+        return ranked.joinToString(ENDPOINT_SEPARATOR) { (name, ip) ->
+            formatEndpoint(name, ip, port)
         }
     }
 }
