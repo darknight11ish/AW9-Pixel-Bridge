@@ -250,16 +250,26 @@ jobs:
           # without the entitlement the app is not authorised for HealthKit, and a
           # bundle declaring workout-processing is rejected. Checked here because
           # signing is disabled in CI, so nothing else would notice.
-          if [ -f WatchBridgeAgent.entitlements ]; then
-            if ! plutil -extract com.apple.developer.healthkit raw -o - WatchBridgeAgent.entitlements >/dev/null 2>&1; then
-              echo "::error::WatchBridgeAgent.entitlements must declare com.apple.developer.healthkit"
-              exit 1
-            fi
-            echo "  entitlements declare com.apple.developer.healthkit"
-          else
+          #
+          # NOTE: `plutil -extract` treats its argument as a KEYPATH, so the
+          # dot-separated entitlement name `com.apple.developer.healthkit` is read as
+          # nested keys and never matches. Dump the plist and match the key literally
+          # instead.
+          if [ ! -f WatchBridgeAgent.entitlements ]; then
             echo "::error::project.yml must generate WatchBridgeAgent.entitlements with com.apple.developer.healthkit"
             exit 1
           fi
+          if ! plutil -p WatchBridgeAgent.entitlements | grep -q '"com.apple.developer.healthkit"'; then
+            echo "::error::WatchBridgeAgent.entitlements must declare com.apple.developer.healthkit"
+            exit 1
+          fi
+          echo "  entitlements declare com.apple.developer.healthkit"
+          # The entitlement must also actually be wired into the target's build settings.
+          grep -q 'CODE_SIGN_ENTITLEMENTS = WatchBridgeAgent.entitlements' "$XCODEPROJ" || {
+            echo "::error::the target does not reference WatchBridgeAgent.entitlements"
+            exit 1
+          }
+          echo "  CODE_SIGN_ENTITLEMENTS is wired to the target"
 
       - name: Type-check the watchOS companion against the watchOS SDK
         run: |
