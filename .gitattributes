@@ -1,0 +1,28 @@
+# Normalise line endings so the repository stays consistent across platforms.
+#
+# The project is built on Windows and verified on Ubuntu and macOS. Without this, a
+# Windows editor can rewrite a whole file's line endings and bury a one-line change in a
+# thousand-line diff.
+* text=auto eol=lf
+
+# Binary assets must never be normalised.
+*.jar binary
+*.apk binary
+*.aab binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.docx binary
+*.xlsx binary
+*.pptx binary
+*.zip binary
+*.jks binary
+*.keystore binary
+
+# Gradle wrapper scripts keep the executable bit.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
