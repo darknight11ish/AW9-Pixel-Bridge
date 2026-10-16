@@ -471,17 +471,52 @@ that added this report), not to the tag. This is precisely the drift the script 
 to prevent, and it is the reason §10's item 10 ("commit the packet generator scripts so
 the review documents are reproducible") was worth doing.
 
-### 12.4 Honest limits of this verification
+### 12.4 What CI proved, and the three bugs it found that local runs did not
 
-* **Swift is typed-checked only in CI.** No Swift toolchain exists on the build host, so
-  the HealthKit additions were reviewed by reading and validated structurally (balanced
-  scopes, single completion path through the `DispatchGroup`) — not compiled here.
+The v1.1.0 push ran the real workflow. **Both jobs are green** (run
+[`38875213993`](https://github.com/darknight11ish/AW9-Pixel-Bridge/actions/runs/38875213993)):
+`build-and-test` passed the JUnit suite, Android Lint, and both APK assemblies, and
+`watchos-companion-typecheck` installed XcodeGen, generated the project, type-checked the
+Swift against the watchOS SDK, and built the generated project with `xcodebuild`.
+
+Getting there took three iterations, and every fix came from CI rather than from local
+runs:
+
+1. **The HTTP test helper depended on connection-close timing.** It read the response
+   with `BufferedReader.readText()`, which only returns when the server closes the
+   socket. That passed repeatedly on the Windows host and timed out on the Ubuntu
+   runner. The helper now parses the status line and headers and reads exactly
+   `Content-Length` bytes — what an HTTP client should do — and retries connection or
+   read timeouts only, so an incorrect response still fails the assertions.
+2. **The document's XcodeGen guard would have been a permanent silent no-op.** XcodeGen
+   is *not* installed on the `macos-14` image (verified against `actions/runner-images`
+   `toolset-14.json`, whose `common_packages` does not list it), so the specified
+   `if command -v xcodegen … fi` step would have skipped forever and never validated
+   `project.yml`. The job now installs a pinned version and fails if generation does not
+   produce the project.
+3. **XcodeGen 2.44+ and Xcode 15 do not interoperate.** Current XcodeGen emits
+   `objectVersion 77` (the Xcode 16 project format); the runner's Xcode 15.4 refuses to
+   open it at all — *"cannot be opened because it is in a future Xcode project file
+   format (77)"*. Measured on the runner: **neither `options.objectVersion` nor
+   `options.compatibilityVersion` in `project.yml` changes the emitted value.** The
+   supported lever is the generator version, so CI pins XcodeGen **2.43.0** from the
+   official release asset, and the step reads the generated `objectVersion` back and
+   fails explicitly if it is ever too new again.
+
+Two of those (1 and 3) are exactly the class of defect this repository's own process
+notes call out: they were invisible to reading, invisible locally, and only a target
+environment could expose them.
+
+### 12.5 Honest limits of this verification
+
 * **No device.** The APK has still never run on a Pixel 9. Everything D-04/D-12/D-13,
   real Health Connect provider behaviour, and the hotspot round trip from an actual
-  Apple Watch remains unverified.
-* **UI is compile-verified, not rendered.** The token card and endpoint card are
-  checked by the Kotlin compiler and lint; no screenshot or instrumentation test exists.
-* **The XcodeGen spec is schema-checked, not executed.** Only a macOS runner can prove
-  `xcodegen generate` + `xcodebuild` succeed, which is why the CI job now installs
-  XcodeGen instead of silently skipping it.
+  Apple Watch remains unverified. CI proves the code compiles, lints, and passes its
+  own tests — not that it works on hardware.
+* **UI is compile-verified, not rendered.** The token card and endpoint card are checked
+  by the Kotlin compiler and lint; no screenshot or instrumentation test exists.
+* **Swift is verified by a type-check and a signed-less build only.** CI compiles the
+  file and builds the generated project with `CODE_SIGNING_ALLOWED=NO`; it does not
+  install or run on a watch, and XcodeGen is pinned to an older release because of the
+  format incompatibility documented in §12.4.
 
