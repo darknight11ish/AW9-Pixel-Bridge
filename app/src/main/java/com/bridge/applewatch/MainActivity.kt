@@ -25,6 +25,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.health.connect.client.PermissionController
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.bridge.applewatch.health.AppleHealthXmlImporter
 import com.bridge.applewatch.health.HealthConnectManager
@@ -126,7 +128,24 @@ class MainActivity : ComponentActivity() {
                     // itself, so any interface coming or going is what matters.
                     val request = NetworkRequest.Builder().build()
                     manager?.registerNetworkCallback(request, callback)
-                    onDispose { manager?.unregisterNetworkCallback(callback) }
+
+                    // The network callback covers changes that happen while the activity
+                    // is alive, but Android may not deliver callbacks that occurred while
+                    // the process was in the background. Re-resolving on resume closes
+                    // that gap, so returning to the app never shows a stale address.
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_RESUME) {
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                webhookEndpoints = resolveActiveEndpoints()
+                            }
+                        }
+                    }
+                    lifecycle.addObserver(observer)
+
+                    onDispose {
+                        manager?.unregisterNetworkCallback(callback)
+                        lifecycle.removeObserver(observer)
+                    }
                 }
 
                 WatchBridgeDashboard(
