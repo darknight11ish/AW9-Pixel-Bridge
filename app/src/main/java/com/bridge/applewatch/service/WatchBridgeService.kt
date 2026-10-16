@@ -20,7 +20,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -75,10 +74,20 @@ class WatchBridgeService : Service() {
          * socket, so this is the cap that stops a flood of silent peers from
          * exhausting the service (OPEN-03).
          */
-        private const val HTTP_MAX_CONCURRENCY = 8
+        const val HTTP_MAX_CONCURRENCY = 8
 
         /** Read timeout for a connected HTTP client, so a half-open peer cannot hang us. */
         private const val HTTP_READ_TIMEOUT_MS = 5_000
+
+        /**
+         * How long a request may wait for a concurrency permit before it is refused with
+         * `503`. Above the read timeout on purpose: a request that has to wait longer
+         * than a slow peer is allowed to hold its socket has already lost.
+         */
+        private const val HTTP_PERMIT_WAIT_MS = 6_000
+
+        /** Poll interval while waiting for an HTTP concurrency permit. */
+        private const val PERMIT_POLL_INTERVAL_MS = 25L
 
         /** Advertised on every response, including 401/403, so browsers can send the token. */
         private const val CORS_ALLOW_HEADERS =
@@ -652,13 +661,89 @@ class WatchBridgeService : Service() {
                     // Bounded concurrency: an unbounded `launch` per connection let a
                     // handful of silent or malicious peers pin unlimited coroutines
                     // and sockets (OPEN-03).
-                    launch { httpSemaphore.withPermit { handleHttpConnection(client) } }
+                    launch { serveIfPermitted(client) }
                 }
             } catch (e: Exception) {
                 if (!isShuttingDown) {
                     logEvent("HTTP Server Error: ${e.message}")
                 }
             }
+        }
+    }
+
+    /**
+     * Waits a bounded time for a concurrency permit, then serves the client.
+     *
+     * The semaphore already caps how many requests run at once, but an *unbounded*
+     * `withPermit` means a connection accepted while every permit is busy simply waits,
+     * holding its socket open for as long as the slow peers take. A flood of such
+     * connections therefore converts the concurrency cap into an unbounded queue. Giving
+     * the wait a deadline, and answering `503` when it expires, keeps the bound honest
+     * and tells a client to retry instead of leaving it hanging.
+     */
+    private suspend fun serveIfPermitted(socket: java.net.Socket) {
+        val acquired = awaitPermit()
+        val overloaded = !acquired
+
+        if (overloaded) {
+            if (!isShuttingDown) {
+                logEvent("HTTP request refused: concurrency limit reached (${HTTP_MAX_CONCURRENCY})")
+                writeOverloadResponse(socket)
+            }
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
+            return
+        }
+
+        try {
+            // The service may have begun shutting down while this request waited.
+            if (!isShuttingDown) handleHttpConnection(socket)
+        } finally {
+            httpSemaphore.release()
+        }
+    }
+
+    /**
+     * Waits up to [HTTP_PERMIT_WAIT_MS] for a permit, polling rather than using a
+     * cancellation-based timeout. A permit is a resource that must be released by
+     * exactly the code that took it, and polling keeps acquisition and release in one
+     * linear path: if this returns true, the caller owns a permit and is responsible for
+     * releasing it in a `finally`.
+     */
+    private suspend fun awaitPermit(): Boolean {
+        val deadline = System.currentTimeMillis() + HTTP_PERMIT_WAIT_MS
+        while (true) {
+            if (isShuttingDown) return false
+            if (httpSemaphore.tryAcquire()) return true
+            if (System.currentTimeMillis() >= deadline) return false
+            delay(PERMIT_POLL_INTERVAL_MS)
+        }
+    }
+
+    /**
+     * Answers a request we had no capacity for. Written on the raw socket because the
+     * normal response path is entered only after a permit is held.
+     */
+    private fun writeOverloadResponse(socket: java.net.Socket) {
+        try {
+            val json = """{"status":"busy","code":503}"""
+            val writer = PrintWriter(socket.getOutputStream(), true)
+            writer.print(
+                "HTTP/1.1 503 Service Unavailable\r\n" +
+                    "Content-Type: application/json\r\n" +
+                    "Access-Control-Allow-Origin: *\r\n" +
+                    "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
+                    "$CORS_ALLOW_HEADERS\r\n" +
+                    "Retry-After: 1\r\n" +
+                    "Content-Length: ${json.toByteArray().size}\r\n" +
+                    "Connection: close\r\n\r\n" +
+                    json
+            )
+            writer.flush()
+        } catch (_: Exception) {
+            // The peer may already be gone; there is nothing useful to do about that.
         }
     }
 
