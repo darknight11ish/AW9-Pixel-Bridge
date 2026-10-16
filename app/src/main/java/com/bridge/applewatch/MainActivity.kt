@@ -2,6 +2,9 @@ package com.bridge.applewatch
 
 import android.Manifest
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -26,6 +29,7 @@ import androidx.lifecycle.lifecycleScope
 import com.bridge.applewatch.health.AppleHealthXmlImporter
 import com.bridge.applewatch.health.HealthConnectManager
 import com.bridge.applewatch.model.WatchTelemetryState
+import com.bridge.applewatch.service.BridgePolicy
 import com.bridge.applewatch.service.WatchBridgeService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -43,7 +47,12 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 val state by WatchBridgeService.telemetry.collectAsState()
                 var hcAuthorized by remember { mutableStateOf(false) }
-                val localIp = remember { resolveLocalWifiIp() }
+                // Seeded from the persisted value so a restart shows the real auth mode
+                // rather than a false "no token" (OPEN-05).
+                var authTokenConfigured by remember {
+                    mutableStateOf(WatchBridgeService.authToken != null)
+                }
+                var webhookEndpoints by remember { mutableStateOf(resolveActiveEndpoints()) }
 
                 val healthPermLauncher = rememberLauncherForActivityResult(
                     PermissionController.createRequestPermissionResultContract()
@@ -93,10 +102,54 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                // Toggling Wi-Fi or the Pixel hotspot changes the address the watch must
+                // POST to. Without this callback the card kept showing the address
+                // resolved at startup, which is exactly the hotspot failure mode
+                // described in the engagement report (OPEN-06).
+                DisposableEffect(Unit) {
+                    val manager = getSystemService(ConnectivityManager::class.java)
+                    val callback = object : ConnectivityManager.NetworkCallback() {
+                        private fun refresh() {
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                webhookEndpoints = resolveActiveEndpoints()
+                            }
+                        }
+
+                        override fun onAvailable(network: Network) = refresh()
+                        override fun onLost(network: Network) = refresh()
+                        override fun onCapabilitiesChanged(
+                            network: Network,
+                            networkCapabilities: android.net.NetworkCapabilities
+                        ) = refresh()
+                    }
+                    // Wildcard request: the bridge server has no network dependency
+                    // itself, so any interface coming or going is what matters.
+                    val request = NetworkRequest.Builder().build()
+                    manager?.registerNetworkCallback(request, callback)
+                    onDispose { manager?.unregisterNetworkCallback(callback) }
+                }
+
                 WatchBridgeDashboard(
                     state = state,
-                    localIp = localIp,
+                    webhookEndpoints = webhookEndpoints,
+                    authTokenConfigured = authTokenConfigured,
                     hcAuthorized = hcAuthorized,
+                    onRefreshEndpoints = {
+                        lifecycleScope.launch(Dispatchers.IO) {
+                            webhookEndpoints = resolveActiveEndpoints()
+                        }
+                    },
+                    onSaveAuthToken = { rawToken ->
+                        val cleaned = rawToken.trim()
+                        WatchBridgeService.setAuthToken(this, cleaned)
+                        authTokenConfigured = WatchBridgeService.authToken != null
+                        WatchBridgeService.appendExternalLog("Updated X-Bridge-Token requirement")
+                    },
+                    onClearAuthToken = {
+                        WatchBridgeService.clearAuthToken(this)
+                        authTokenConfigured = false
+                        WatchBridgeService.appendExternalLog("Cleared X-Bridge-Token (LAN-only mode)")
+                    },
                     onAuthorizeHealthConnect = {
                         healthPermLauncher.launch(HealthConnectManager.REQUIRED_PERMISSIONS)
                     },
@@ -126,26 +179,42 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun resolveLocalWifiIp(): String {
-        return try {
-            NetworkInterface.getNetworkInterfaces().toList()
-                .flatMap { it.inetAddresses.toList() }
-                .firstOrNull { !it.isLoopbackAddress && it.hostAddress?.contains(':') == false }
-                ?.hostAddress ?: "127.0.0.1"
-        } catch (_: Exception) {
-            "0.0.0.0"
-        }
+    /**
+     * Every private IPv4 address this phone currently holds, formatted with the hotspot
+     * first so the address the watch must POST to is the one shown (OPEN-06).
+     *
+     * The old `resolveLocalWifiIp()` returned whichever interface the enumeration
+     * happened to yield first, which on a phone running its own hotspot could be an
+     * address the watch cannot reach.
+     */
+    private fun resolveActiveEndpoints(): String = try {
+        val candidates = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { iface ->
+                iface.inetAddresses.toList()
+                    .filter { !it.isLoopbackAddress && it.hostAddress?.contains(':') == false }
+                    .map { iface.name to (it.hostAddress ?: "") }
+            }
+            .filter { (_, ip) -> ip.isNotBlank() }
+        BridgePolicy.sortAndFormatEndpoints(candidates)
+    } catch (_: Exception) {
+        BridgePolicy.sortAndFormatEndpoints(emptyList())
     }
 }
 
 @Composable
 fun WatchBridgeDashboard(
     state: WatchTelemetryState,
-    localIp: String,
+    webhookEndpoints: String,
+    authTokenConfigured: Boolean,
     hcAuthorized: Boolean,
+    onRefreshEndpoints: () -> Unit,
+    onSaveAuthToken: (String) -> Unit,
+    onClearAuthToken: () -> Unit,
     onAuthorizeHealthConnect: () -> Unit,
     onImportXmlClick: () -> Unit
 ) {
+    var tokenInput by remember { mutableStateOf("") }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -185,11 +254,77 @@ fun WatchBridgeDashboard(
                     fontSize = 13.sp
                 )
                 Text(
-                    text = "Webhook Server: http://$localIp:8484/telemetry",
+                    text = "Webhook endpoints (hotspot first)",
+                    color = Color(0xFF8B949E),
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = webhookEndpoints,
                     color = Color(0xFF58A6FF),
                     fontSize = 13.sp,
                     fontFamily = FontFamily.Monospace
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(onClick = onRefreshEndpoints) {
+                        Text("Refresh IP", color = Color(0xFF58A6FF), fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        // Webhook security: the token was previously settable only by editing code,
+        // which made it effectively unusable (OPEN-05).
+        Card(
+            colors = CardDefaults.cardColors(containerColor = Color(0xFF161B22)),
+            shape = RoundedCornerShape(14.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "Webhook Security (X-Bridge-Token)",
+                    color = Color.White,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 14.sp
+                )
+                Text(
+                    text = if (authTokenConfigured) "● Token Auth Active (X-Bridge-Token required)"
+                    else "◌ Open Private LAN / Hotspot (No Token Set)",
+                    color = if (authTokenConfigured) Color(0xFF3FB950) else Color(0xFFD29922),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                OutlinedTextField(
+                    value = tokenInput,
+                    onValueChange = { tokenInput = it },
+                    label = { Text("Shared secret token", fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Button(
+                        onClick = { onSaveAuthToken(tokenInput) },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF238636)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Save Token", color = Color.White, fontSize = 12.sp)
+                    }
+                    Button(
+                        onClick = {
+                            tokenInput = ""
+                            onClearAuthToken()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF21262D)),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Clear Token", color = Color.White, fontSize = 12.sp)
+                    }
+                }
             }
         }
 

@@ -119,4 +119,83 @@ internal object BridgePolicy {
         }
         return diff == 0
     }
+
+    // ------------------------------------------------- webhook endpoint discovery
+
+    /** Priority of the Pixel's own hotspot / USB tethering interface. */
+    const val ENDPOINT_PRIORITY_HOTSPOT = 0
+
+    /** Priority of the primary Wi-Fi interface. */
+    const val ENDPOINT_PRIORITY_WIFI = 1
+
+    /** Priority of any other private-LAN interface. */
+    const val ENDPOINT_PRIORITY_OTHER = 2
+
+    /** Interface-name prefixes Android uses for its own SoftAP / tethering roles. */
+    private val HOTSPOT_NAME_PREFIXES =
+        listOf("ap", "softap", "swlan", "wlan1", "rndis")
+
+    /** Default gateway addresses the Pixel serves when it *is* the access point. */
+    private val HOTSPOT_ADDRESS_PREFIXES =
+        listOf("192.168.43.", "192.168.49.")
+
+    /**
+     * Ranks a network interface for webhook display (OPEN-06).
+     *
+     * The watch must POST to whichever address the phone holds *as an access point*,
+     * but the old code returned the first non-loopback IPv4 it found, so on a phone
+     * that was simultaneously on Wi-Fi and running a hotspot it could display a Wi-Fi
+     * address the watch cannot reach.
+     *
+     * Lower is better:
+     * - [ENDPOINT_PRIORITY_HOTSPOT]: SoftAP/tethering by interface name, or the
+     *   well-known Pixel hotspot gateway ranges (`192.168.43.x`, `192.168.49.x`).
+     *   Address matching matters because interface naming varies by vendor.
+     * - [ENDPOINT_PRIORITY_WIFI]: `wlan*` / `en*` (primary Wi-Fi or Ethernet).
+     * - [ENDPOINT_PRIORITY_OTHER]: anything else that is still a private address.
+     */
+    fun classifyInterfacePriority(ifName: String, ipAddress: String): Int {
+        val name = ifName.trim().lowercase()
+        val ip = ipAddress.trim()
+        if (HOTSPOT_NAME_PREFIXES.any { name.startsWith(it) }) return ENDPOINT_PRIORITY_HOTSPOT
+        if (HOTSPOT_ADDRESS_PREFIXES.any { ip.startsWith(it) }) return ENDPOINT_PRIORITY_HOTSPOT
+        if (name.startsWith("wlan") || name.startsWith("en")) return ENDPOINT_PRIORITY_WIFI
+        return ENDPOINT_PRIORITY_OTHER
+    }
+
+    /**
+     * Formats every candidate `(interfaceName, ipAddress)` pair into the webhook URLs
+     * to show the user, hotspot first and labelled with its interface (OPEN-06).
+     *
+     * Multiple interfaces are not an error: the union is shown, because the correct
+     * one depends on which network the watch actually joined. The order is stable for
+     * equal priorities (sorted by interface name, then address), so the display does
+     * not jitter between refreshes. If nothing qualified, the loopback URL is returned
+     * with an instruction, rather than an empty card.
+     */
+    fun sortAndFormatEndpoints(candidates: List<Pair<String, String>>, port: Int = 8484): String {
+        val ranked = candidates
+            .filter { (_, ip) -> ip.isNotBlank() && isPrivateNetworkAddress(ip) }
+            .distinctBy { (_, ip) -> ip }
+            .sortedWith(
+                compareBy(
+                    { (name, ip) -> classifyInterfacePriority(name, ip) },
+                    { (name, _) -> name.lowercase() },
+                    { (_, ip) -> ip }
+                )
+            )
+
+        if (ranked.isEmpty()) {
+            return "http://127.0.0.1:$port/telemetry (Enable Wi-Fi or 2.4GHz Hotspot)"
+        }
+
+        return ranked.joinToString("\n") { (name, ip) ->
+            val label = when (classifyInterfacePriority(name, ip)) {
+                ENDPOINT_PRIORITY_HOTSPOT -> "Hotspot ($name)"
+                ENDPOINT_PRIORITY_WIFI -> "Wi-Fi ($name)"
+                else -> "LAN ($name)"
+            }
+            "$label: http://$ip:$port/telemetry"
+        }
+    }
 }
