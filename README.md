@@ -7,6 +7,49 @@ network. No cloud service, account or developer program is involved in the data 
 
 ---
 
+## What this app is, in plain terms
+
+**The problem it solves.** Apple Watch health data lives on the iPhone, in Apple Health.
+Google Health Connect — the health data store Android apps read from — is on the Pixel.
+Nothing connects the two, so an Apple Watch user switching to a Pixel has no way to get
+their own heart rate, steps and sleep across.
+
+**What this app does about it.** It makes the Pixel act as a small receiving station. The
+watch (or an iPhone app, or a Shortcut) sends a health reading over your home Wi-Fi or
+the Pixel's own hotspot to a web address the phone is serving. The phone receives it and
+files it into Google Health Connect, where other Android health apps can then read it.
+
+```text
+  Apple Watch  ──(Wi-Fi / Pixel hotspot)──▶  Pixel 9                    ──▶  Google
+  HealthKit reading         HTTP POST        receives it and files it        Health Connect
+                                             into the local store
+```
+
+**What it deliberately does not do.** Nothing leaves your local network — there is no
+server, no account, and no sync to anyone else. It is also **one-way**: the phone cannot
+control the watch and the watch cannot read anything back.
+
+**The catch you should know before installing.** Apple does not let a watch app act as a
+Bluetooth heart-rate sensor, and the Apple Watch does not broadcast the standard
+Bluetooth heart-rate signal that Android can pick up. So the watch cannot simply "pair"
+with the Pixel the way a chest strap would. The reading has to be *pushed* by something
+running on the Apple side, which is why this README offers three ways to do that (§2):
+an Apple Watch **Shortcut** (free, no Apple developer account), the **Health Auto
+Export** app from the App Store, or this project's own **watchOS companion app** (needs
+Xcode and an Apple account). It also does not understand every HealthKit metric — see
+§5 for the exact list of records it writes.
+
+**What it can do with no watch involved at all.** It can import an existing Apple Health
+`export.xml` file, which moves years of historical data into Health Connect in one go.
+
+**Why you would sideload it.** This is not a Play Store app. You install the APK
+directly, and the release APK is signed with the standard Android debug key so it is
+immediately installable — see the [Releases
+page](https://github.com/darknight11ish/AW9-Pixel-Bridge/releases) for the APKs and §7
+for the build commands.
+
+---
+
 ## 1. What actually works (verified architecture)
 
 The design that was originally specified — the watch advertising the standard
