@@ -92,6 +92,13 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 
+    // The android.jar used for JVM unit tests contains only *stubs* of org.json:
+    // every method returns a default (JSONObject.length() == 0, opt() == null), so a
+    // parser test would silently assert against defaults. A real implementation on the
+    // test-only classpath makes WebhookPayloadParserTest meaningful; it is not shipped,
+    // so the APK still uses the platform's own org.json.
+    testImplementation("org.json:json:20240303")
+
     // Robolectric runs the Android service layer on the JVM so WatchBridgeService
     // logic can be tested without a device.
     testImplementation("org.robolectric:robolectric:4.14.1")
