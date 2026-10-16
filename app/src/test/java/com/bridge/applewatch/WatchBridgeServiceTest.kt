@@ -170,15 +170,15 @@ class WatchBridgeServiceTest {
 
     @Test
     fun `the http port answers a cors preflight without a token`() {
-        val server = Robolectric.buildService(WatchBridgeService::class.java).create().get()
+        val server = startBridge()
         try {
             // A browser never attaches credentials to OPTIONS, so the preflight must
             // be answered before the auth check or no browser client can ever work.
             WatchBridgeService.setAuthToken(context, "required-secret")
 
-            val response = rawRequest("OPTIONS /telemetry HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            val response = rawRequest(server.port, "OPTIONS /telemetry HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
             assertNotNull(
-                "expected the bridge to accept an HTTP connection on :8484 " +
+                "expected the bridge to accept an HTTP connection on :${server.port} " +
                     "(last error: $lastSocketError)",
                 response
             )
@@ -194,24 +194,28 @@ class WatchBridgeServiceTest {
             )
             assertTrue(response.contains("Access-Control-Allow-Methods: GET, POST, OPTIONS"))
         } finally {
-            destroy(server)
+            destroy(server.service)
         }
     }
 
     @Test
     fun `a token-protected status request is refused without the token`() {
-        val server = Robolectric.buildService(WatchBridgeService::class.java).create().get()
+        val server = startBridge()
         try {
             WatchBridgeService.setAuthToken(context, "required-secret")
 
-            val refused = rawRequest("GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            assertNotNull("expected the bridge to accept an HTTP connection (last error: $lastSocketError)", refused)
+            val refused = rawRequest(server.port, "GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            assertNotNull(
+                "expected the bridge to accept an HTTP connection (last error: $lastSocketError)",
+                refused
+            )
             assertTrue("expected 401, got: $refused", refused!!.startsWith("HTTP/1.1 401"))
 
             val allowed = rawRequest(
+                server.port,
                 "GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Bridge-Token: required-secret\r\n\r\n"
             )
-            assertNotNull(allowed)
+            assertNotNull("expected the second request to be served (last error: $lastSocketError)", allowed)
             assertTrue("expected 200, got: $allowed", allowed!!.startsWith("HTTP/1.1 200"))
             assertTrue(allowed.contains("\"status\":\"online\""))
             // 401/403 responses must carry the CORS headers too, or a browser client
@@ -222,14 +226,129 @@ class WatchBridgeServiceTest {
                 )
             )
         } finally {
-            destroy(server)
+            destroy(server.service)
         }
     }
 
+    /** A running service plus the loopback port its listener actually bound. */
+    private class RunningBridge(val service: WatchBridgeService, val port: Int)
+
+    // ------------------------------------- parser wiring into the service
+
+    @Test
+    fun `a Shortcuts-shaped telemetry body reaches the service state`() {
+        val server = startBridge()
+        try {
+            val body = """
+                {"heart_rate":68,"walking_running_distance":2.4,
+                 "blood_oxygen_saturation":0.985,"active_energy":310.5}
+            """.trimIndent()
+            val response = postTelemetry(server.port, body)
+            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
+
+            val state = WatchBridgeService.telemetry.value
+            // Proves the service is wired to the universal parser and not to the old
+            // camelCase-only reader: none of these keys are native field names.
+            assertEquals(68, state.heartRateBpm)
+            assertEquals(2400.0, state.distanceMeters, 1e-6)
+            assertEquals(98.5, state.spo2Percent, 1e-6)
+            assertEquals(310.5, state.activeKcal, 1e-6)
+        } finally {
+            destroy(server.service)
+        }
+    }
+
+    @Test
+    fun `a Health Auto Export body is summed and committed`() {
+        val server = startBridge()
+        try {
+            val body = """{"data":{"metrics":[
+                 {"name":"heart_rate","units":"bpm","data":[{"Avg":74}]},
+                 {"name":"step_count","units":"count","data":[{"qty":400},{"qty":350}]}]}}"""
+            val response = postTelemetry(server.port, body)
+            assertNotNull("no response (last error: $lastSocketError)", response)
+            assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
+
+            val state = WatchBridgeService.telemetry.value
+            assertEquals(74, state.heartRateBpm)
+            assertEquals(750L, state.stepsToday)
+        } finally {
+            destroy(server.service)
+        }
+    }
+
+    @Test
+    fun `a malformed body is answered and leaves the known state intact`() {
+        val server = startBridge()
+        try {
+            postTelemetry(server.port, """{"heart_rate":71}""")
+            assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
+
+            // The handler swallows malformed JSON into a log line rather than letting
+            // it escape the connection, so the client still gets a response.
+            val response = postTelemetry(server.port, "{definitely not json")
+            assertNotNull("malformed body must still be answered (last error: $lastSocketError)", response)
+            assertTrue(response!!.startsWith("HTTP/1.1 200"))
+            assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
+        } finally {
+            destroy(server.service)
+        }
+    }
+
+    /** POSTs a JSON body to the bridge's real listener and returns the raw response. */
+    private fun postTelemetry(port: Int, body: String): String? {
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        return rawRequest(
+            port,
+            "POST /telemetry HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "\r\n" +
+                body
+        )
+    }
+
+    /**
+     * Starts the service and opens a second listener on an **ephemeral** port for the
+     * test to talk to.
+     *
+     * The service's own listener binds the fixed production port 8484, and a
+     * predecessor's socket is not released instantly, so binding that port per test is
+     * inherently racy. [WatchBridgeService] is not hard-wired to one port, so the test
+     * starts its own listener on port 0 instead and reads back the port the OS
+     * assigned. The handler, the peer gate, the auth check and the CORS preflight are
+     * all exercised exactly as in production; only the port number differs.
+     */
+    private fun startBridge(): RunningBridge {
+        val service = Robolectric.buildService(WatchBridgeService::class.java).create().get()
+        val start = WatchBridgeService::class.java
+            .getDeclaredMethod("startLocalHttpServer", Int::class.javaPrimitiveType)
+        start.isAccessible = true
+        start.invoke(service, 0)
+
+        val field = WatchBridgeService::class.java.getDeclaredField("serverSocket")
+        field.isAccessible = true
+        val deadline = System.currentTimeMillis() + 5_000
+        while (System.currentTimeMillis() < deadline) {
+            val socket = field.get(service) as? java.net.ServerSocket
+            if (socket != null && socket.isBound && !socket.isClosed) {
+                return RunningBridge(service, socket.localPort)
+            }
+            Thread.sleep(20)
+        }
+        destroy(service)
+        throw AssertionError(
+            "the bridge never bound a listener; recent logs: " +
+                WatchBridgeService.telemetry.value.recentLogs.take(5)
+        )
+    }
+
     /** Opens the bridge port and returns the raw response, or null if it is unreachable. */
-    private fun rawRequest(request: String): String? = try {
+    private fun rawRequest(port: Int, request: String): String? = try {
         Socket().use { socket ->
-            socket.connect(InetSocketAddress("127.0.0.1", 8484), 2_000)
+            socket.connect(InetSocketAddress("127.0.0.1", port), 2_000)
             socket.soTimeout = 2_000
             // Deliberately not closed with `use`: closing the writer closes the
             // underlying socket, so the response could never be read back.
@@ -251,9 +370,9 @@ class WatchBridgeServiceTest {
         WatchBridgeService.loadPersistedStepBaseline(context, LocalDate.now().toEpochDay())
 
     /**
-     * Closes the listener. Every service instantiated here must be destroyed before
-     * the next test, because the bridge port is fixed at 8484 and a still-bound
-     * predecessor makes the next instance fail to bind silently.
+     * Closes the listener. Every service instantiated here is destroyed before the test
+     * ends, so a still-bound predecessor cannot make a later service fail to bind the
+     * fixed production port.
      */
     private fun destroy(service: WatchBridgeService) {
         try {

@@ -10,12 +10,22 @@
 | Visibility | PUBLIC |
 | `main` HEAD when generated | `5c4b4eace559a100eeda4a2cd39ff3dff88beb43` (short `5c4b4ea`); one docs-only commit is added after this to record the report itself |
 | Code state described | Tag **`v1.0.2`** = `517986bcde5a485125d54ff35ecd5a1ecb8bee6f` — the released, verified artifact this report documents |
-| Release tags | `v1.0.0`, `v1.0.1`, `v1.0.2` (latest) |
+| Release tags | `v1.0.0`, `v1.0.1`, `v1.0.2` (latest at time of writing); `v1.1.0` added in §12 |
 | Tracked files at HEAD | 32 |
 | Total tracked bytes | 524,156 |
 | Platform | Google Pixel 9 (Android 14+, API 34+) ⇄ Apple Watch Series 9 (watchOS 10+) |
 | Input specification | `docs/AW9_PIXEL_BRIDGE_SPEC.md` (2,063 lines, archived verbatim) |
 | Review packet | `docs/GEMINI_REVIEW_PACKET.md` (+ `.docx`) — the deep-dive defect review |
+
+> **Correction (v1.1.0).** Every figure in this document is now reproducible with
+> `python3 scripts/verify_repo_metrics.py`, and re-measuring exposed two errors in the
+> original counts. The `524,156` byte total above is accurate but belongs to **`main`
+> HEAD `5c4b4ea`**, not to tag `v1.0.2`: the tag itself is **32 files / 510,151 bytes**.
+> The per-release figures in §1 do not reproduce either — measured values are
+> `v1.0.0` = 26 files / **238,044** bytes and `v1.0.1` = 28 files / **464,707** bytes,
+> against the 260,191 and 507,064 recorded there. The file *counts* in §1 are correct;
+> the byte totals were not measured from `git ls-files` when written. §12.3 records the
+> full reconciliation.
 
 ---
 
@@ -27,7 +37,11 @@ Three releases were shipped, all built and verified by CI:
 |---|---|---|---|---|---|
 | v1.0.0 | Specification built as written | 26 | 260,191 | 5 | 0 errors / 8 warnings |
 | v1.0.1 | Hardening: defects D-01…D-14 | 28 | 507,064 | 11 | 0 errors / 8 warnings |
-| v1.0.2 | Token, bounded reconnect, D-07/D-07b/D-09, watchOS CI | 32 | 524,156 | 25 | 0 errors / 12 warnings |
+| v1.0.2 | Token, bounded reconnect, D-07/D-07b/D-09, watchOS CI | 32 | 510,151 | 25 | 0 errors / 12 warnings |
+| v1.1.0 | Closure of all ten open items (OPEN-01…OPEN-10) | 45 | see §12.3 | 58 | 0 errors / 14 warnings |
+
+> The v1.0.0 and v1.0.1 byte totals in this table are the originally published ones; the
+> measured values differ (238,044 and 464,707) — see §12.3 for the reconciliation.
 
 **Five findings matter more than the rest:**
 
@@ -400,3 +414,73 @@ These are the conclusions a reviewer should weigh, offered as claims to challeng
 ---
 
 *End of report. Every hash, file count and size above was computed from the repository at the commit recorded in section 1. The detailed per-file review — including the full source and the conformance diff — is `docs/GEMINI_REVIEW_PACKET.md`.*
+
+---
+
+## 12. `v1.1.0` — closure of the ten open items
+
+The four workstreams below were built as four separate branches off `main` `e4d1dc2`,
+each merged with `--no-ff` so the per-workstream history is preserved. They touch
+**disjoint files**, so no merge produced a conflict. Every claim in this section was
+verified on the host that produced it; the Swift and CI claims are verified by the
+macOS CI job, not locally (§12.4).
+
+### 12.1 What changed, per open item
+
+| ID | Closed by | Verified locally by |
+|---|---|---|
+| **OPEN-01** | GATT connects only when the advertisement exposes `0x180D`/`0x1814`; `STATE_CONNECTED` now only logs "verifying services" and calls `discoverServices()`; `isBleConnected` is earned in `onServicesDiscovered` after the HR/RSC characteristics are confirmed; a device without either is disconnected, closed, and the GATT queue advanced | Static inspection + lint; no radio in unit tests |
+| **OPEN-02** | The `devName.contains("Apple Watch")` match is deleted; `watchName` falls back to `"BLE Biometric Sensor"` | Static inspection |
+| **OPEN-03** | `Semaphore(8)` per accepted client, `soTimeout = 5_000`, the whole `handleHttpConnection` wrapped in `try/catch`, `OPTIONS` answered `204` with CORS headers **before** the peer and auth gates, and `Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, Authorization` on 200/401/403 | Two Robolectric tests over a **real loopback socket**: the 204 preflight (with a token configured, proving it bypasses auth) and the 401-without-token → 200-with-token path |
+| **OPEN-04** | Step baseline persisted under `aw9_step_baseline` keyed by epoch-day and restored in `onCreate`; a previous day's baseline is discarded; `recordIdsList` handling isolated into one documented `committedCount(fallback)` extension with the `@SuppressLint` local to it | Four Robolectric tests: round-trip, `onCreate` adoption, stale-day rejection, sentinel non-persistence |
+| **OPEN-05** | Webhook Security card with the real mode in colour, a masked input, **Save Token** and **Clear Token**, both logging through `appendExternalLog`; the configured flag is seeded from the persisted value | Compiles under lint; UI behaviour itself needs a device |
+| **OPEN-06** | `classifyInterfacePriority` (SoftAP names + `192.168.43.x`/`192.168.49.x`) and `sortAndFormatEndpoints`; the activity resolves **all** interfaces, registers a `ConnectivityManager.NetworkCallback` in `DisposableEffect(Unit)`, and offers **Refresh IP** | Five `BridgePolicy` tests, including the required `("wlan0", 192.168.1.25)` vs `("ap0", 192.168.43.1)` ordering, private-address filtering, dedupe, and the no-interface fallback |
+| **OPEN-07** | `WebhookPayloadParser` normalises all three dialects (flat camelCase, Shortcuts snake_case/HealthKit aliases, Health Auto Export `data.metrics`), scaling fractional SpO₂/battery and km→m only where units are implicit | 11 parser tests; **and** three end-to-end tests that POST those bodies to the service's real listener and assert the resulting telemetry state |
+| **OPEN-08** | 8 `AppleHealthXmlImporter` tests (timestamp parsing, HR clamping, the SpO₂ fraction/percent ambiguity, steps, distance, the D-05 SDNN gate) and the parser suite | Those tests run on the JVM |
+| **OPEN-09** | `pollBackgroundVitals()` (limit-1 `HKSampleQuery` sorted by end date, run through a `DispatchGroup`) polls resting HR and respiratory rate; both are added to `typesToRead` and to the POSTed body; `project.yml` (XcodeGen) and a validated `Info.plist` add the installable project | YAML/plist parse-validated locally; Swift type-check and `xcodebuild` are the macOS CI gate |
+| **OPEN-10** | `scripts/verify_repo_metrics.py` (stdlib only) and a README documenting the proven architecture, all three watch options, hotspot mode, and the accepted JSON shapes | The script is exercised in §12.3 |
+
+### 12.2 A correction to the review packet itself
+
+The review packet (and the prompt derived from it) asserted that
+`WatchBridgeAgent.swift` "has no `X-Bridge-Token` input field". **That is stale.** The
+file already contained `@Published var bridgeToken`, already set the header in
+`postTelemetryToPixel`, and already rendered `SecureField("Bridge token (optional)", …)`.
+Nothing was added for that item, and the existing `SecureField` was kept rather than
+being downgraded to the plain `TextField` the prompt specified — a masked field is the
+correct control for a secret. Assuming the packet was accurate would have meant
+re-adding code that was already there and weakening a security affordance.
+
+### 12.3 Metrics, made reproducible — and two numbers that did not survive it
+
+`scripts/verify_repo_metrics.py` walks `git ls-files`, so "tracked" now has one
+definition that CI can re-derive. It also dereferences annotated tags to their commit,
+after an early run reported the *tag object's* hash instead of the commit's.
+
+| Revision | Measured | This report claimed |
+|---|---|---|
+| `v1.0.0` (`8f791b4`) | 26 files / 238,044 B | 26 files / 260,191 B |
+| `v1.0.1` (`68e0624`) | 28 files / 464,707 B | 28 files / 507,064 B |
+| Tag `v1.0.2` (`517986b`) | 32 files / 510,151 B | 32 files / **524,156 B** |
+| `main` `5c4b4ea` | 32 files / **524,156 B** | (this figure was listed against the tag) |
+
+The counts are right; the byte totals were not measured from the repository when
+written. The `524,156` value is real but belongs to `main` `5c4b4ea` (the docs commit
+that added this report), not to the tag. This is precisely the drift the script exists
+to prevent, and it is the reason §10's item 10 ("commit the packet generator scripts so
+the review documents are reproducible") was worth doing.
+
+### 12.4 Honest limits of this verification
+
+* **Swift is typed-checked only in CI.** No Swift toolchain exists on the build host, so
+  the HealthKit additions were reviewed by reading and validated structurally (balanced
+  scopes, single completion path through the `DispatchGroup`) — not compiled here.
+* **No device.** The APK has still never run on a Pixel 9. Everything D-04/D-12/D-13,
+  real Health Connect provider behaviour, and the hotspot round trip from an actual
+  Apple Watch remains unverified.
+* **UI is compile-verified, not rendered.** The token card and endpoint card are
+  checked by the Kotlin compiler and lint; no screenshot or instrumentation test exists.
+* **The XcodeGen spec is schema-checked, not executed.** Only a macOS runner can prove
+  `xcodegen generate` + `xcodebuild` succeed, which is why the CI job now installs
+  XcodeGen instead of silently skipping it.
+

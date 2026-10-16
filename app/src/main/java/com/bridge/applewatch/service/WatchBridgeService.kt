@@ -14,8 +14,8 @@ import com.bridge.applewatch.MainActivity
 import com.bridge.applewatch.ble.BlePacketParser
 import com.bridge.applewatch.control.PixelControlDispatcher
 import com.bridge.applewatch.health.HealthConnectManager
+import com.bridge.applewatch.health.WebhookPayloadParser
 import com.bridge.applewatch.model.WatchTelemetryState
-import com.bridge.applewatch.model.WebhookTelemetryPayload
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -789,32 +789,16 @@ class WatchBridgeService : Service() {
     private suspend fun processWebhookTelemetryJson(rawBody: String) {
         if (rawBody.isBlank()) return
         try {
-            val json = JSONObject(rawBody)
+            // All three supported dialects (native camelCase, Apple Shortcuts
+            // snake_case and Health Auto Export's nested metrics) are normalised by
+            // the parser, so this method no longer reads JSON keys itself. The
+            // legacy `findMyPixel: true` flag is likewise resolved to "FIND_MY_PIXEL".
+            val payload = WebhookPayloadParser.parse(rawBody)
 
-            if (json.optBoolean("findMyPixel", false)) {
-                val res = controlDispatcher.executeCommand("FIND_MY_PIXEL")
+            if (payload.controlCommand.isNotBlank()) {
+                val res = controlDispatcher.executeCommand(payload.controlCommand)
                 _telemetry.value = _telemetry.value.copy(lastControlAction = res)
             }
-            val cmd = json.optString("controlCommand", "")
-            if (cmd.isNotBlank()) {
-                val res = controlDispatcher.executeCommand(cmd)
-                _telemetry.value = _telemetry.value.copy(lastControlAction = res)
-            }
-
-            val payload = WebhookTelemetryPayload(
-                heartRate = json.optInt("heartRate", 0),
-                steps = json.optLong("steps", -1L),
-                distanceMeters = json.optDouble("distanceMeters", -1.0),
-                activeCalories = json.optDouble("activeCalories", -1.0),
-                spo2 = json.optDouble("spo2", -1.0),
-                floorsClimbed = json.optDouble("floorsClimbed", -1.0),
-                hrvMs = json.optDouble("hrvMs", -1.0),
-                restingHeartRate = json.optInt("restingHeartRate", 0),
-                respiratoryRate = json.optDouble("respiratoryRate", -1.0),
-                sleepMinutes = json.optLong("sleepMinutes", -1L),
-                battery = json.optInt("battery", -1),
-                controlCommand = cmd
-            )
 
             val advance = BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
             if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
