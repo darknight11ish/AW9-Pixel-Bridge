@@ -345,11 +345,18 @@ class WatchBridgeServiceTest {
         )
     }
 
-    /** Opens the bridge port and returns the raw response, or null if it is unreachable. */
+    /**
+     * Opens the bridge port and returns the raw response headers plus body, or null if
+     * it is unreachable.
+     *
+     * The body is read by its declared `Content-Length` rather than by reading to EOF:
+     * relying on the server's `close()` to signal end-of-stream is timing dependent and
+     * behaved differently on the Linux CI runner than on the development host.
+     */
     private fun rawRequest(port: Int, request: String): String? = try {
         Socket().use { socket ->
-            socket.connect(InetSocketAddress("127.0.0.1", port), 2_000)
-            socket.soTimeout = 2_000
+            socket.connect(InetSocketAddress("127.0.0.1", port), 3_000)
+            socket.soTimeout = 5_000
             // Deliberately not closed with `use`: closing the writer closes the
             // underlying socket, so the response could never be read back.
             val out = PrintWriter(socket.getOutputStream(), true)
@@ -357,7 +364,29 @@ class WatchBridgeServiceTest {
             // PrintWriter only auto-flushes on println, so flush explicitly or the
             // server never sees the request line.
             out.flush()
-            BufferedReader(InputStreamReader(socket.getInputStream())).use { it.readText() }
+
+            val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            val headers = StringBuilder()
+            var contentLength = -1
+            while (true) {
+                val line = reader.readLine() ?: break
+                if (line.isEmpty()) break
+                headers.append(line).append("\r\n")
+                if (line.startsWith("Content-Length:", ignoreCase = true)) {
+                    contentLength = line.substringAfter(":").trim().toIntOrNull() ?: -1
+                }
+            }
+            if (contentLength > 0) {
+                val body = CharArray(contentLength)
+                var total = 0
+                while (total < contentLength) {
+                    val read = reader.read(body, total, contentLength - total)
+                    if (read == -1) break
+                    total += read
+                }
+                headers.append("\r\n").append(String(body, 0, total))
+            }
+            headers.toString()
         }
     } catch (e: Exception) {
         lastSocketError = "${e.javaClass.name}: ${e.message}"
