@@ -36,6 +36,12 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
     @Published var spo2: Double = -1.0
     @Published var floors: Double = 0
     @Published var hrvMs: Double = 0
+    /// Latest resting heart rate sampled from HealthKit. 0 means "no reading yet",
+    /// which the Android side's 30...150 range check skips rather than fabricating.
+    @Published var restingHr: Int = 0
+    /// Latest respiratory rate in breaths/min. -1.0 means "no reading yet" and is
+    /// likewise skipped by the Android side's 4...60 range check.
+    @Published var respiratoryRate: Double = -1.0
     @Published var isStreaming = false
     @Published var lastPushStatus: String = "Idle"
 
@@ -53,7 +59,11 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
             HKObjectType.quantityType(forIdentifier: .distanceWalkingRunning)!,
             HKObjectType.quantityType(forIdentifier: .oxygenSaturation)!,
             HKObjectType.quantityType(forIdentifier: .flightsClimbed)!,
-            HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!
+            HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
+            // These two are not delivered by HKLiveWorkoutDataSource: they are
+            // periodic HealthKit values, so they are polled once streaming starts.
+            HKObjectType.quantityType(forIdentifier: .restingHeartRate)!,
+            HKObjectType.quantityType(forIdentifier: .respiratoryRate)!
         ]
 
         healthStore.requestAuthorization(toShare: typesToShare, read: typesToRead) { success, _ in
@@ -71,10 +81,68 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
                 self.workoutSession?.startActivity(with: Date())
                 self.builder?.beginCollection(withStart: Date()) { _, _ in }
                 DispatchQueue.main.async { self.isStreaming = true }
+                // Fetch the latest polled vitals now, so the first webhook already
+                // carries resting HR and respiratory rate instead of waiting for the
+                // next sample to arrive.
+                self.pollBackgroundVitals()
             } catch {
                 print("HKWorkoutSession Error: \(error)")
             }
         }
+    }
+
+    /// Reads the most recent resting heart rate and respiratory rate from HealthKit.
+    ///
+    /// Neither is produced by `HKLiveWorkoutDataSource` — they are periodic values the
+    /// system computes — so each is fetched with a single-sample `HKSampleQuery`
+    /// sorted newest-first. Both lookups are dispatched together and the resulting
+    /// payload is pushed once, so a partially-populated POST cannot be mistaken for a
+    /// reading that does not exist.
+    func pollBackgroundVitals() {
+        let group = DispatchGroup()
+        var latestRestingHr = 0
+        var latestRespiratory = -1.0
+
+        if let restingType = HKObjectType.quantityType(forIdentifier: .restingHeartRate) {
+            group.enter()
+            latestSample(of: restingType) { sample in
+                if let sample = sample {
+                    let bpmUnit = HKUnit.count().unitDivided(by: .minute())
+                    latestRestingHr = Int(sample.quantity.doubleValue(for: bpmUnit).rounded())
+                }
+                group.leave()
+            }
+        }
+
+        if let respiratoryType = HKObjectType.quantityType(forIdentifier: .respiratoryRate) {
+            group.enter()
+            latestSample(of: respiratoryType) { sample in
+                if let sample = sample {
+                    let breathUnit = HKUnit.count().unitDivided(by: .minute())
+                    latestRespiratory = sample.quantity.doubleValue(for: breathUnit)
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            if latestRestingHr > 0 { self.restingHr = latestRestingHr }
+            if latestRespiratory > 0 { self.respiratoryRate = latestRespiratory }
+            self.postTelemetryToPixel(controlCommand: "")
+        }
+    }
+
+    /// Newest-first, limit-1 sample lookup. Completion is always invoked exactly once so
+    /// the caller's dispatch group cannot deadlock on an error path.
+    private func latestSample(of type: HKQuantityType, completion: @escaping (HKQuantitySample?) -> Void) {
+        let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
+        let query = HKSampleQuery(sampleType: type, predicate: nil, limit: 1, sortDescriptors: [sort]) { _, samples, error in
+            if let error = error {
+                print("\(type.identifier) query failed: \(error)")
+            }
+            completion(samples?.first as? HKQuantitySample)
+        }
+        healthStore.execute(query)
     }
 
     func workoutBuilder(_ workoutBuilder: HKLiveWorkoutBuilder, didCollectDataOf collectedTypes: Set<HKSampleType>) {
@@ -135,6 +203,8 @@ final class WatchTelemetryStreamer: NSObject, ObservableObject, HKWorkoutSession
             "spo2": spo2,
             "floorsClimbed": floors,
             "hrvMs": hrvMs,
+            "restingHeartRate": restingHr,
+            "respiratoryRate": respiratoryRate,
             "battery": battery,
             "controlCommand": controlCommand
         ]
@@ -185,10 +255,14 @@ struct WatchBridgeView: View {
         ScrollView {
             VStack(spacing: 8) {
                 TextField("Pixel 9 IP", text: $streamer.pixelIp)
+                // A secret, so it is masked rather than rendered as plain text.
                 SecureField("Bridge token (optional)", text: $streamer.bridgeToken)
                 Text("\(streamer.liveBpm) BPM")
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.red)
+                Text("Resting \(streamer.restingHr) BPM · Resp \(String(format: "%.1f", streamer.respiratoryRate)) brpm")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
                 Text(streamer.lastPushStatus)
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
@@ -204,6 +278,9 @@ struct WatchBridgeView: View {
                 Button("Ring Pixel 9") {
                     streamer.postTelemetryToPixel(controlCommand: "FIND_MY_PIXEL")
                 }.tint(.orange)
+                Button("Refresh Resting HR / Resp Rate") {
+                    streamer.pollBackgroundVitals()
+                }.tint(.blue)
             }
         }
     }

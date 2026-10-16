@@ -85,6 +85,27 @@ jobs:
           swift --version
           xcrun --sdk watchos --show-sdk-path
 
+      - name: Install XcodeGen
+        # XcodeGen is deliberately installed rather than probed with
+        # `command -v xcodegen`: it is not present on the macos runner images, so a
+        # guarded step would silently pass forever and never verify project.yml.
+        # Installing it here means the generation step below is a real gate.
+        run: brew install xcodegen
+
+      - name: Generate the watchOS Xcode project from project.yml
+        run: |
+          set -o pipefail
+          cd watchos-companion
+          xcodegen generate
+          test -d WatchBridgeAgent.xcodeproj || {
+            echo "xcodegen did not produce WatchBridgeAgent.xcodeproj" >&2
+            exit 1
+          }
+          echo "Generated project:"
+          ls -la WatchBridgeAgent.xcodeproj
+          echo "Info.plist lint:"
+          plutil -lint Info.plist
+
       - name: Type-check the watchOS companion against the watchOS SDK
         run: |
           set -o pipefail
@@ -96,6 +117,18 @@ jobs:
           swiftc -typecheck -parse-as-library -sdk "$SDK" -target arm64-apple-watchos10.0 \
             watchos-companion/WatchBridgeAgent.swift
           echo "watchOS 10 type-check passed"
+
+      - name: Build the generated watchOS project
+        # The type-check above proves the Swift compiles; this proves the XcodeGen spec
+        # actually produces a buildable app, which is the part `project.yml` claims.
+        run: |
+          set -o pipefail
+          cd watchos-companion
+          xcodebuild -project WatchBridgeAgent.xcodeproj \
+            -scheme WatchBridgeAgent \
+            -destination 'generic/platform=watchOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
 
       # NOTE: `swift build --triple arm64-apple-watchos10.0` is deliberately NOT used
       # here. SwiftPM cannot locate the watchOS standard library without an Xcode
