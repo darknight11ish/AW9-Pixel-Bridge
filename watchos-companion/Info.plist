@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>AW9 Bridge</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+
+	<!-- Standalone watchOS app: no iOS companion bundle is required. -->
+	<key>WKApplication</key>
+	<true/>
+	<key>WKWatchOnly</key>
+	<true/>
+
+	<!-- HealthKit: the app reads watch biometrics and shares the workout session. -->
+	<key>NSHealthShareUsageDescription</key>
+	<string>AW9 Bridge reads your heart rate, HRV, resting heart rate, respiratory rate, blood oxygen, steps, distance, active energy and flights climbed so it can forward them to your own Pixel 9 over the local network. Data never leaves your local network.</string>
+	<key>NSHealthUpdateUsageDescription</key>
+	<string>AW9 Bridge starts and saves your own workout session so HealthKit keeps delivering live samples while the bridge is streaming.</string>
+
+	<!-- The bridge target is the phone's plain-HTTP server on the private LAN /
+	     hotspot, which App Transport Security would otherwise block. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+
+	<!-- Required so the workout session keeps sampling with the wrist down. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>workout-processing</string>
+	</array>
+</dict>
+</plist>

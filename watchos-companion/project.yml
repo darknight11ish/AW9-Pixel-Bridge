@@ -1,0 +1,55 @@
+# XcodeGen project specification for the standalone watchOS companion (OPEN-09).
+#
+# Generate the project on macOS with:
+#   brew install xcodegen      # not pre-installed on the GitHub macos runner images
+#   cd watchos-companion && xcodegen generate
+#   open WatchBridgeAgent.xcodeproj
+#
+# `xcodegen generate` reads this file from the current directory and writes
+# <name>.xcodeproj next to it, so the generated project has the same name as `name`.
+#
+# Platform is declared per target with `platform: watchOS`. XcodeGen documents that
+# app targets do NOT support the `supportedDestinations: [watchOS]` form, so the
+# `platform` key is the correct route for a watch app.
+name: WatchBridgeAgent
+
+options:
+  bundleIdPrefix: com.bridge.applewatch
+  deploymentTarget:
+    watchOS: "10.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+
+targets:
+  WatchBridgeAgent:
+    type: application
+    platform: watchOS
+    deploymentTarget: "10.0"
+    sources:
+      - path: WatchBridgeAgent.swift
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: AW9 Bridge
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        WKApplication: true
+        WKWatchOnly: true
+        UIBackgroundModes:
+          - workout-processing
+        NSHealthShareUsageDescription: >-
+          AW9 Bridge reads your heart rate, HRV, resting heart rate, respiratory rate,
+          blood oxygen, steps, distance, active energy and flights climbed so it can
+          forward them to your own Pixel 9 over the local network.
+        NSHealthUpdateUsageDescription: >-
+          AW9 Bridge starts and saves your own workout session so HealthKit keeps
+          delivering live samples while the bridge is streaming.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: NO
+        PRODUCT_BUNDLE_IDENTIFIER: com.bridge.applewatch.watchkitapp
+        PRODUCT_NAME: WatchBridgeAgent
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "4"
