@@ -124,6 +124,74 @@ jobs:
           echo "Info.plist lint:"
           plutil -lint Info.plist
 
+      - name: Verify the generated project carries the required watchOS settings
+        # Guards the contract project.yml claims: a standalone, watch-only app whose only
+        # transport is plain HTTP to the phone on :8484. If XcodeGen ever stops honouring
+        # a key (or a target is dropped) the plist and settings would be wrong in ways
+        # `xcodebuild` alone would not catch -- the app would build and then fail at
+        # runtime on the watch.
+        #
+        # The checks key off `plutil` exit status rather than comparing captured output,
+        # because the textual form of a boolean differs between `raw` and `json` (-extract
+        # is documented as json/xml/raw). Status codes are unambiguous.
+        run: |
+          set -o pipefail
+          cd watchos-companion
+
+          require_key() {
+            if ! plutil -extract "$1" raw -o /dev/null Info.plist >/dev/null 2>&1; then
+              echo "::error::Info.plist is missing required key: $1"
+              exit 1
+            fi
+            echo "  present: $1"
+          }
+
+          echo "--- Info.plist required keys ---"
+          require_key WKApplication
+          require_key WKWatchOnly
+          require_key NSHealthShareUsageDescription
+          require_key NSHealthUpdateUsageDescription
+
+          # ATS must allow the plain-HTTP bridge on the LAN; `-extract ... raw` prints 1
+          # for a true boolean.
+          ats="$(plutil -extract NSAppTransportSecurity.NSAllowsArbitraryLoads raw -o - Info.plist 2>/dev/null || true)"
+          if [ "$ats" != "1" ] && [ "$ats" != "true" ]; then
+            echo "::error::Info.plist must set NSAppTransportSecurity.NSAllowsArbitraryLoads (got '${ats:-none}')"
+            exit 1
+          fi
+          echo "  NSAppTransportSecurity.NSAllowsArbitraryLoads = $ats"
+
+          # The workout session must keep sampling with the wrist down.
+          if ! plutil -extract UIBackgroundModes json -o - Info.plist 2>/dev/null | grep -q 'workout-processing'; then
+            echo "::error::Info.plist must declare UIBackgroundModes = [workout-processing]"
+            exit 1
+          fi
+          echo "  UIBackgroundModes includes workout-processing"
+
+          echo "--- XcodeGen target identity ---"
+          XCODEPROJ=WatchBridgeAgent.xcodeproj/project.pbxproj
+
+          # Reading the scheme back also proves the project is actually openable.
+          xcodebuild -project WatchBridgeAgent.xcodeproj -list
+
+          grep -q 'SDKROOT = watchos' "$XCODEPROJ" || {
+            echo "::error::the generated target is not a watchOS target"
+            exit 1
+          }
+          echo "  SDKROOT = watchos"
+
+          grep -q 'WATCHOS_DEPLOYMENT_TARGET = 10.0' "$XCODEPROJ" || {
+            echo "::error::watchOS deployment target must be 10.0"
+            exit 1
+          }
+          echo "  WATCHOS_DEPLOYMENT_TARGET = 10.0"
+
+          grep -q 'PRODUCT_BUNDLE_IDENTIFIER = com.bridge.applewatch.watchkitapp' "$XCODEPROJ" || {
+            echo "::error::unexpected product bundle identifier"
+            exit 1
+          }
+          echo "  PRODUCT_BUNDLE_IDENTIFIER = com.bridge.applewatch.watchkitapp"
+
       - name: Type-check the watchOS companion against the watchOS SDK
         run: |
           set -o pipefail
