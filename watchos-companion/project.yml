@@ -19,13 +19,18 @@ options:
     watchOS: "10.0"
   createIntermediateGroups: true
   generateEmptyDirectories: false
-  # Pin the generated project format for compatibility. XcodeGen's default is the
-  # newest format its version knows (objectVersion 77 = Xcode 16), which Xcode 15
-  # refuses to open at all: "cannot be opened because it is in a future Xcode project
-  # file format (77)". Confirmed on the macos-14 runner, which ships Xcode 15.4.
-  # objectVersion 56 is readable by Xcode 15 and 16 alike.
-  objectVersion: 56
-  xcodeVersion: "15.0"
+  # Pin the generated project format for compatibility with the runner's Xcode.
+  #
+  # XcodeGen's Homebrew build emits the newest format it knows, `objectVersion 77`
+  # (the Xcode 16 format). The macos-14 image ships Xcode 15.4, which refuses to open
+  # it at all: "cannot be opened because it is in a future Xcode project file format
+  # (77)". `compatibilityVersion` is XcodeGen's documented control over the project
+  # format and is emitted alongside objectVersion.
+  #
+  # Measured on the runner: setting only `objectVersion: 56` had NO effect (the
+  # generated project was still 77), so the workflow now reads the generated value
+  # back and fails with an explicit message rather than trusting this key blindly.
+  compatibilityVersion: "Xcode 14.0"
 
 targets:
   WatchBridgeAgent:
