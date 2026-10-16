@@ -38,7 +38,7 @@ Three releases were shipped, all built and verified by CI:
 | v1.0.0 | Specification built as written | 26 | 260,191 | 5 | 0 errors / 8 warnings |
 | v1.0.1 | Hardening: defects D-01…D-14 | 28 | 507,064 | 11 | 0 errors / 8 warnings |
 | v1.0.2 | Token, bounded reconnect, D-07/D-07b/D-09, watchOS CI | 32 | 510,151 | 25 | 0 errors / 12 warnings |
-| v1.1.0 | Closure of all ten open items (OPEN-01…OPEN-10) | 45 | see §12.3 | 58 | 0 errors / 14 warnings |
+| v1.1.0 | Closure of all ten open items (OPEN-01…OPEN-10) | 40 | 709,724 | 58 | 0 errors / 14 warnings |
 
 > The v1.0.0 and v1.0.1 byte totals in this table are the originally published ones; the
 > measured values differ (238,044 and 464,707) — see §12.3 for the reconciliation.
@@ -463,6 +463,7 @@ after an early run reported the *tag object's* hash instead of the commit's.
 | `v1.0.1` (`68e0624`) | 28 files / 464,707 B | 28 files / 507,064 B |
 | Tag `v1.0.2` (`517986b`) | 32 files / 510,151 B | 32 files / **524,156 B** |
 | `main` `5c4b4ea` | 32 files / **524,156 B** | (this figure was listed against the tag) |
+| `v1.1.0` (`f5bdb8b` + report) | 40 files / 709,724 B | — |
 
 The counts are right; the byte totals were not measured from the repository when
 written. The `524,156` value is real but belongs to `main` `5c4b4ea` (the docs commit
