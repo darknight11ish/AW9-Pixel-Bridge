@@ -89,7 +89,9 @@ dashboard's **Webhook Security** card.
 The server handles at most 8 requests at once. A request that arrives while all 8 are
 busy waits briefly for a slot; if it still cannot get one it is answered with
 `503 Service Unavailable` and `Retry-After`, rather than being left hanging or queued
-without limit. A well-behaved client should retry on 503.
+without limit. A well-behaved client should retry on 503. Request bodies are capped at
+256 KiB (`413` beyond that) and header blocks are bounded (`431`), so a malformed or
+hostile client cannot make the service allocate without limit.
 
 ---
 
@@ -162,11 +164,17 @@ omits the unit:
 `findMyPixel: true` is still accepted as a legacy alias for `"FIND_MY_PIXEL"`.
 
 **2. Apple Shortcuts snake_case / HealthKit aliases** — `heart_rate`/`bpm`,
-`step_count`, `active_energy`/`active_calories`, `walking_running_distance` (**km** →
-metres) or `distance_km`, `blood_oxygen_saturation`/`oxygen_saturation`
-(a `0.5–1.0` fraction is scaled to percent), `flights_climbed`,
-`heart_rate_variability`/`hrv_sdnn`, `resting_heart_rate`, `respiratory_rate`,
+`step_count`, `active_energy`/`active_calories`, `walking_running_distance`
+(**km** → metres) or `distance_km` / `distance_m` / `distance_mi`,
+`blood_oxygen_saturation`/`oxygen_saturation` (a `0.5–1.0` fraction is scaled to
+percent), `flights_climbed`, `resting_heart_rate`, `respiratory_rate`,
 `sleep_minutes`, `battery_level` (a `0.0–1.0` fraction is scaled to 0–100).
+
+> **HRV:** only RMSSD-named keys (`hrv`, `hrv_rmssd`, `rmssd`) are imported. Apple's
+> HealthKit HRV is **SDNN**, which is a different metric from the RMSSD that Health
+> Connect's only HRV record type stores — SDNN-named fields such as
+> `heart_rate_variability` or `hrv_sdnn` are deliberately ignored rather than
+> mislabelled into an RMSSD record.
 
 **3. *Health Auto Export* nested metrics** — `{"data":{"metrics":[{"name":…,"units":…,
 "data":[{"qty":…}]}]}}`. `qty` is used, falling back to `Avg` for heart rate;

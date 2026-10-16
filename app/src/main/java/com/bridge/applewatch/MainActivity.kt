@@ -49,10 +49,12 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 val state by WatchBridgeService.telemetry.collectAsState()
                 var hcAuthorized by remember { mutableStateOf(false) }
-                // Seeded from the persisted value so a restart shows the real auth mode
-                // rather than a false "no token" (OPEN-05).
+                // Seeded from *storage*, not from the service's static: the static is
+                // only populated by the service's onCreate, so reading it here showed
+                // "No Token Set" for a persisted token until the service happened to
+                // start — and permanently if the Bluetooth permission was denied.
                 var authTokenConfigured by remember {
-                    mutableStateOf(WatchBridgeService.authToken != null)
+                    mutableStateOf(WatchBridgeService.hasPersistedAuthToken(this))
                 }
                 var webhookEndpoints by remember { mutableStateOf(resolveActiveEndpoints()) }
 
@@ -185,10 +187,26 @@ class MainActivity : ComponentActivity() {
             try {
                 WatchBridgeService.appendExternalLog("Parsing Apple Health export.xml...")
                 contentResolver.openInputStream(uri)?.use { stream ->
-                    val parsedRecords = AppleHealthXmlImporter.parseExportXmlStream(stream, maxRecords = 5000)
-                    val inserted = healthManager.insertBatchRecords(parsedRecords)
+                    val result = AppleHealthXmlImporter.parseExportXmlStream(stream, maxRecords = 5000)
+                    if (result.records.isEmpty()) {
+                        // Do not claim a successful import of nothing. A truncated or
+                        // malformed document reaches this branch, and the user needs to
+                        // know the difference between "no records" and "unreadable file".
+                        WatchBridgeService.appendExternalLog(
+                            "Apple Health import produced no records" +
+                                (result.stopReason?.let { " — $it" } ?: "")
+                        )
+                        return@use
+                    }
+                    val inserted = healthManager.insertBatchRecords(result.records)
+                    val completeness = if (result.complete) {
+                        "complete"
+                    } else {
+                        "PARTIAL: ${result.stopReason ?: "document was truncated"}"
+                    }
                     WatchBridgeService.appendExternalLog(
-                        "Imported $inserted historical Apple Health XML records into Health Connect",
+                        "Imported $inserted of ${result.records.size} parsed Apple Health " +
+                            "XML records ($completeness)",
                         xmlCountDelta = inserted
                     )
                 }

@@ -19,6 +19,7 @@ import com.bridge.applewatch.model.WatchTelemetryState
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Semaphore
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -76,9 +77,6 @@ class WatchBridgeService : Service() {
          */
         const val HTTP_MAX_CONCURRENCY = 8
 
-        /** Read timeout for a connected HTTP client, so a half-open peer cannot hang us. */
-        private const val HTTP_READ_TIMEOUT_MS = 5_000
-
         /**
          * How long a request may wait for a concurrency permit before it is refused with
          * `503`. Above the read timeout on purpose: a request that has to wait longer
@@ -92,6 +90,26 @@ class WatchBridgeService : Service() {
         /** Advertised on every response, including 401/403, so browsers can send the token. */
         private const val CORS_ALLOW_HEADERS =
             "Access-Control-Allow-Headers: Content-Type, X-Bridge-Token, Authorization"
+
+        /**
+         * Largest request body this bridge will read.
+         *
+         * The body buffer used to be allocated directly from the client-supplied
+         * `Content-Length` before a single byte was read, so `Content-Length: 2000000000`
+         * allocated ~4 GB and killed the process — and `OutOfMemoryError` is an `Error`,
+         * so the handler's `catch (e: Exception)` never saw it. A telemetry payload is a
+         * few hundred bytes; 256 KiB is generous.
+         */
+        const val MAX_REQUEST_BODY_BYTES = 256 * 1024
+
+        /** Upper bound on request headers, to stop an endless header block. */
+        private const val MAX_HEADER_LINES = 100
+
+        /** Upper bound on a single header line. */
+        private const val MAX_HEADER_LINE_CHARS = 8 * 1024
+
+        /** Read timeout for a connected HTTP client, so a half-open peer cannot hang us. */
+        private const val HTTP_READ_TIMEOUT_MS = 5_000
 
         /** Optional shared secret. Empty means the bridge accepts any private peer. */
         @Volatile
@@ -134,6 +152,20 @@ class WatchBridgeService : Service() {
         }
 
         /**
+         * True when a token is persisted, regardless of whether the service has started.
+         *
+         * The dashboard used to read the static [authToken], which is only populated by
+         * [loadAuthToken] inside the service's `onCreate`. Before the service started —
+         * or if the user denied the Bluetooth permissions so it never started — the card
+         * wrongly reported "No Token Set" while a token was in fact stored and would be
+         * enforced. Reading storage directly makes the badge truthful.
+         */
+        fun hasPersistedAuthToken(context: Context): Boolean =
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(PREF_AUTH_TOKEN, null)
+                ?.isNotBlank() == true
+
+        /**
          * Restores the step baseline persisted by a previous run (OPEN-04).
          *
          * The cumulative step counter is monotonic *within a day*, so a stored value is
@@ -173,14 +205,19 @@ class WatchBridgeService : Service() {
             BridgePolicy.isPrivateNetworkAddress(host)
 
         fun appendExternalLog(message: String, xmlCountDelta: Int = 0) {
-            val current = _telemetry.value
-            val updatedLogs = (listOf("[${LocalTime.now().withNano(0)}] $message") + current.recentLogs).take(25)
-            _telemetry.value = current.copy(
-                xmlImportedRecords = current.xmlImportedRecords + xmlCountDelta,
-                healthConnectSyncedCount = current.healthConnectSyncedCount + xmlCountDelta,
-                lastSyncStatus = message,
-                recentLogs = updatedLogs
-            )
+            // `update` is an atomic compare-and-set. Plain `value = value.copy(...)` is a
+            // read-modify-write that several callers race on (HTTP handlers, BLE binder
+            // callbacks, the flush coroutine, the UI thread), silently dropping each
+            // other's counters and log lines.
+            _telemetry.update { current ->
+                current.copy(
+                    xmlImportedRecords = current.xmlImportedRecords + xmlCountDelta,
+                    healthConnectSyncedCount = current.healthConnectSyncedCount + xmlCountDelta,
+                    lastSyncStatus = message,
+                    recentLogs = (listOf("[${LocalTime.now().withNano(0)}] $message") + current.recentLogs)
+                        .take(25)
+                )
+            }
         }
     }
 
@@ -198,6 +235,16 @@ class WatchBridgeService : Service() {
     private val gattOperationQueue = ConcurrentLinkedQueue<Runnable>()
     @Volatile private var isGattOperationInProgress = false
 
+    /**
+     * Serialises every read-modify-write of the GATT queue state.
+     *
+     * The queue is advanced from the BLE binder callbacks, from the watchdog coroutine
+     * on `Dispatchers.IO`, and from the operations themselves. Without a lock, a late
+     * callback and the watchdog could both poll and both run an operation, breaking the
+     * "one GATT request in flight" invariant Android's GATT layer requires.
+     */
+    private val gattQueueLock = Any()
+
     /** Incremented every time an operation is pulled off the queue; the watchdog compares it. */
     @Volatile private var gattOperationToken = 0L
     private var gattWatchdogJob: Job? = null
@@ -211,6 +258,12 @@ class WatchBridgeService : Service() {
 
     /** Last advertised address we saw for a bridge-capable peripheral. */
     @Volatile private var lastConnectCandidate: BluetoothDevice? = null
+
+    /**
+     * Address whose reconnect budget is spent. Prevents the low-latency scan from
+     * starting a fresh attempt on every advertisement while the device is still visible.
+     */
+    @Volatile private var exhaustedForAddress: String? = null
 
     /** Set before closing the listener so a deliberate shutdown is not logged as an error. */
     @Volatile private var isShuttingDown = false
@@ -231,6 +284,25 @@ class WatchBridgeService : Service() {
      */
     private var lastCumulativeSteps = BridgePolicy.NO_STEP_BASELINE
 
+    /**
+     * Epoch-day the in-memory [lastCumulativeSteps] belongs to.
+     *
+     * The watch's cumulative counter restarts at midnight, and `advanceStepBaseline`
+     * deliberately emits nothing when a counter decreases. A service that stays alive
+     * across midnight — its normal mode, being a foreground service — would therefore
+     * keep yesterday's baseline and silently swallow the new day's steps until the new
+     * counter passed the old total, often into the afternoon. The baseline is reset on
+     * the day boundary instead. This is distinct from the restart case, where
+     * [loadPersistedStepBaseline] already discards a stale day.
+     */
+    @Volatile private var baselineEpochDay = Long.MIN_VALUE
+
+    /**
+     * Serialises the whole read-compute-persist sequence for the step baseline, so two
+     * concurrent webhooks cannot both advance it from the same stale value.
+     */
+    private val stepBaselineLock = Any()
+
     override fun onCreate() {
         super.onCreate()
         shuttingDownForTest = false
@@ -238,7 +310,9 @@ class WatchBridgeService : Service() {
         // Reuse today's baseline so a service restart does not treat the watch's
         // cumulative counter as brand-new and dump a whole day into one window
         // (OPEN-04).
-        lastCumulativeSteps = loadPersistedStepBaseline(this, LocalDate.now().toEpochDay())
+        val today = LocalDate.now().toEpochDay()
+        lastCumulativeSteps = loadPersistedStepBaseline(this, today)
+        baselineEpochDay = today
         healthManager = HealthConnectManager(this)
         controlDispatcher = PixelControlDispatcher(this, serviceScope)
 
@@ -279,9 +353,15 @@ class WatchBridgeService : Service() {
     }
 
     private fun logEvent(msg: String) {
-        val current = _telemetry.value
-        val logs = (listOf("[${LocalTime.now().withNano(0)}] $msg") + current.recentLogs).take(25)
-        _telemetry.value = current.copy(lastSyncStatus = msg, recentLogs = logs)
+        // Atomic: see appendExternalLog. Non-atomic writes from concurrent callers lost
+        // log lines and, in the same races, counter updates.
+        _telemetry.update { current ->
+            current.copy(
+                lastSyncStatus = msg,
+                recentLogs = (listOf("[${LocalTime.now().withNano(0)}] $msg") + current.recentLogs)
+                    .take(25)
+            )
+        }
     }
 
     private fun startBleContinuityAndGattScan() {
@@ -308,11 +388,11 @@ class WatchBridgeService : Service() {
                 BlePacketParser.parseAppleContinuityManufacturerData(appleBytes)?.let { parsed ->
                     smoothedRssi = BridgePolicy.smoothRssi(smoothedRssi, rssi)
                     val smoothed = smoothedRssi.toInt()
-                    _telemetry.value = _telemetry.value.copy(
+                    _telemetry.update { current -> current.copy(
                         rssi = smoothed,
                         estimatedMeters = BlePacketParser.estimateDistanceMeters(smoothed),
                         continuityState = parsed.activityLevelDescription
-                    )
+                    ) }
                 }
             }
 
@@ -327,21 +407,49 @@ class WatchBridgeService : Service() {
             if (matchesBridge) {
                 if (deviceAddress.isNotBlank()) trackedWatchAddress = deviceAddress
                 lastConnectCandidate = result.device
+                // The scan fires every 20-100 ms in low-latency mode, which is exactly
+                // the state right after a failed attempt. Connecting straight from here
+                // would bypass the bounded-retry gate entirely, so a device that
+                // advertises the service but never exposes a usable characteristic
+                // (or fails discovery) would be reconnected without backoff, leaking a
+                // GATT client per cycle. Respect the budget instead.
+                val budgetAvailable = connectAttempts < BridgePolicy.MAX_CONNECT_ATTEMPTS
                 if (!_telemetry.value.isBleConnected && !isBleConnecting) {
-                    beginGattConnection(result.device, devName, deviceAddress)
+                    if (budgetAvailable) {
+                        beginGattConnection(result.device, devName, deviceAddress)
+                    } else {
+                        // Latch the gate until the scan sees the device disappear, so the
+                        // "budget exhausted" path does not churn on every advertisement.
+                        if (deviceAddress != exhaustedForAddress) {
+                            exhaustedForAddress = deviceAddress
+                            logEvent(
+                                "GATT reconnect budget exhausted for $deviceAddress — " +
+                                    "waiting for it to stop advertising"
+                            )
+                        }
+                    }
                 }
+            } else if (deviceAddress.isNotBlank() && deviceAddress == exhaustedForAddress) {
+                // The peripheral stopped advertising a bridge service; clear the latch so
+                // a genuinely new attempt is allowed when it returns.
+                exhaustedForAddress = null
+                connectAttempts = 0
             }
         }
     }
 
     private fun beginGattConnection(device: BluetoothDevice, devName: String, deviceAddress: String) {
         isBleConnecting = true
+        // Close any previous client before replacing the reference, or the old one
+        // becomes unreachable and is never released (Android's per-process GATT client
+        // slots are finite).
+        closeActiveGatt()
         // The name is provisional until onServicesDiscovered proves the device is
         // usable, so record only what the stack actually reported.
-        _telemetry.value = _telemetry.value.copy(
+        _telemetry.update { current -> current.copy(
             watchName = devName.ifBlank { UNKNOWN_SENSOR_NAME },
             watchMacAddress = deviceAddress
-        )
+        ) }
         try {
             activeGatt = device.connectGatt(
                 this,
@@ -361,6 +469,17 @@ class WatchBridgeService : Service() {
         }
     }
 
+    /** Closes and clears the active GATT client, if any. Safe to call repeatedly. */
+    private fun closeActiveGatt() {
+        val gatt = activeGatt ?: return
+        activeGatt = null
+        try {
+            gatt.close()
+        } catch (e: Exception) {
+            logEvent("GATT close error: ${e.message}")
+        }
+    }
+
     /**
      * If the controller never reports STATE_CONNECTED or STATE_DISCONNECTED, the
      * gate would stay latched and streaming would never resume. Close the attempt,
@@ -373,11 +492,9 @@ class WatchBridgeService : Service() {
             if (!isActive || !isBleConnecting) return@launch
             logEvent("GATT connect timed out after ${CONNECT_TIMEOUT_MS}ms")
             isBleConnecting = false
-            try {
-                activeGatt?.close()
-            } catch (_: Exception) {
-            }
-            activeGatt = null
+            // Close only the client this attempt owns; `activeGatt` may already point at
+            // a newer one if a late callback raced the timeout.
+            closeActiveGatt()
             scheduleConnectRetry()
         }
     }
@@ -385,8 +502,8 @@ class WatchBridgeService : Service() {
     private fun scheduleConnectRetry() {
         if (lastConnectCandidate == null) return
         if (connectAttempts >= BridgePolicy.MAX_CONNECT_ATTEMPTS) {
+            // Do NOT reset the counter here: doing so made the budget throttle nothing.
             logEvent("GATT reconnect budget exhausted — waiting for a fresh advertisement")
-            connectAttempts = 0
             return
         }
         val delayMs = BridgePolicy.connectRetryDelayMs(connectAttempts)
@@ -408,23 +525,42 @@ class WatchBridgeService : Service() {
     }
 
     private fun enqueueGattOperation(op: Runnable) {
-        gattOperationQueue.add(op)
-        if (!isGattOperationInProgress) {
-            executeNextGattOperation()
+        val shouldStart = synchronized(gattQueueLock) {
+            gattOperationQueue.add(op)
+            if (isGattOperationInProgress) {
+                false
+            } else {
+                isGattOperationInProgress = true
+                true
+            }
         }
+        if (shouldStart) executeNextGattOperation()
     }
 
+    /**
+     * Advances the queue by exactly one operation.
+     *
+     * Poll-flag-token are updated under [gattQueueLock] and `next.run()` is deliberately
+     * invoked *outside* the lock: the operation bodies call back into
+     * [executeNextGattOperation], which would deadlock if the lock were held here.
+     */
     private fun executeNextGattOperation() {
         gattWatchdogJob?.cancel()
         gattWatchdogJob = null
-        val next = gattOperationQueue.poll()
-        if (next == null) {
-            isGattOperationInProgress = false
-            return
-        }
-        val token = ++gattOperationToken
-        isGattOperationInProgress = true
-        armGattWatchdog(token)
+
+        val next = synchronized(gattQueueLock) {
+            val polled = gattOperationQueue.poll()
+            if (polled == null) {
+                isGattOperationInProgress = false
+                null
+            } else {
+                gattOperationToken += 1
+                isGattOperationInProgress = true
+                polled
+            }
+        } ?: return
+
+        armGattWatchdog(gattOperationToken)
         next.run()
     }
 
@@ -461,14 +597,20 @@ class WatchBridgeService : Service() {
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 cancelConnectTimeout()
                 isBleConnecting = false
-                isGattOperationInProgress = false
-                gattOperationQueue.clear()
+                synchronized(gattQueueLock) {
+                    isGattOperationInProgress = false
+                    gattOperationQueue.clear()
+                }
                 gattWatchdogJob?.cancel()
                 gattWatchdogJob = null
-                _telemetry.value = _telemetry.value.copy(
+                // The link is gone, so the client must be closed. Not closing it here
+                // leaked one GATT client per disconnect/retry cycle until the process
+                // ran out of them and BLE died until restart.
+                closeActiveGatt()
+                _telemetry.update { current -> current.copy(
                     isBleConnected = false,
                     sensorContactOnWrist = false
-                )
+                ) }
                 logEvent("BLE GATT Disconnected — Auto-reconnect armed")
                 // A dropped link is the expected path for a bounded retry.
                 if (!isShuttingDown) scheduleConnectRetry()
@@ -497,11 +639,11 @@ class WatchBridgeService : Service() {
 
             // Only now is the link provably useful, so this is where "connected" is
             // earned. Never guess a product name (OPEN-02).
-            _telemetry.value = _telemetry.value.copy(
+            _telemetry.update { current -> current.copy(
                 isBleConnected = true,
                 watchName = gatt.device.name?.takeIf { it.isNotBlank() } ?: UNKNOWN_SENSOR_NAME,
                 watchMacAddress = gatt.device.address
-            )
+            ) }
             logEvent(
                 "BLE GATT Connected to ${gatt.device.address} " +
                     "(0x180D=${if (hasHr) "yes" else "no"}, 0x1814=${if (hasRsc) "yes" else "no"})"
@@ -565,7 +707,7 @@ class WatchBridgeService : Service() {
         ) {
             if (characteristic.uuid == BATTERY_LEVEL_CHAR_UUID && value.isNotEmpty()) {
                 val pct = (value[0].toInt() and 0xFF).coerceIn(0, 100)
-                _telemetry.value = _telemetry.value.copy(batteryPercent = pct)
+                _telemetry.update { current -> current.copy(batteryPercent = pct) }
             }
             executeNextGattOperation()
         }
@@ -591,14 +733,16 @@ class WatchBridgeService : Service() {
      * operation is left waiting on a closed client.
      */
     private fun abandonGattLink(gatt: BluetoothGatt) {
-        isGattOperationInProgress = false
-        gattOperationQueue.clear()
+        synchronized(gattQueueLock) {
+            isGattOperationInProgress = false
+            gattOperationQueue.clear()
+        }
         gattWatchdogJob?.cancel()
         gattWatchdogJob = null
-        _telemetry.value = _telemetry.value.copy(
+        _telemetry.update { current -> current.copy(
             isBleConnected = false,
             sensorContactOnWrist = false
-        )
+        ) }
         try {
             gatt.disconnect()
             gatt.close()
@@ -634,20 +778,20 @@ class WatchBridgeService : Service() {
                     hrSampleBuffer.add(
                         HeartRateRecord.Sample(Instant.now(), parsed.bpm.toLong())
                     )
-                    _telemetry.value = _telemetry.value.copy(
+                    _telemetry.update { current -> current.copy(
                         heartRateBpm = parsed.bpm,
                         sensorContactOnWrist = parsed.contactDetected,
                         hrvRmssdMs = latestRmssd
-                    )
+                    ) }
                 }
             }
             RSC_MEASUREMENT_CHAR_UUID -> {
                 val rsc = BlePacketParser.parseRscMeasurement(bytes) ?: return
-                _telemetry.value = _telemetry.value.copy(
+                _telemetry.update { current -> current.copy(
                     runningSpeedMps = rsc.instantaneousSpeedMps,
                     runningCadenceSpm = rsc.instantaneousCadenceSpm,
                     distanceMeters = rsc.totalDistanceMeters ?: _telemetry.value.distanceMeters
-                )
+                ) }
             }
         }
     }
@@ -778,8 +922,20 @@ class WatchBridgeService : Service() {
 
                 var contentLength = 0
                 var presentedToken: String? = null
+                var headerLines = 0
                 var line = reader.readLine()
                 while (!line.isNullOrEmpty()) {
+                    if (++headerLines > MAX_HEADER_LINES || line.length > MAX_HEADER_LINE_CHARS) {
+                        // An endless or enormous header block would otherwise grow the
+                        // reader's buffer without limit (the socket timeout only bounds
+                        // idle time, not total bytes).
+                        logEvent("HTTP request rejected: header block too large")
+                        writeResponse(
+                            writer, 431, "Request Header Fields Too Large",
+                            """{"status":"headers_too_large","code":431}"""
+                        )
+                        return
+                    }
                     when {
                         line.startsWith("Content-Length:", ignoreCase = true) ->
                             contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
@@ -787,6 +943,19 @@ class WatchBridgeService : Service() {
                             presentedToken = line.substringAfter(":").trim()
                     }
                     line = reader.readLine()
+                }
+
+                // Refuse an oversized body BEFORE allocating for it.
+                if (contentLength > MAX_REQUEST_BODY_BYTES) {
+                    logEvent(
+                        "HTTP request rejected: declared body of $contentLength bytes exceeds " +
+                            "the $MAX_REQUEST_BODY_BYTES byte limit"
+                    )
+                    writeResponse(
+                        writer, 413, "Payload Too Large",
+                        """{"status":"payload_too_large","code":413,"limit":$MAX_REQUEST_BODY_BYTES}"""
+                    )
+                    return
                 }
 
                 val body = if (contentLength > 0) {
@@ -822,7 +991,7 @@ class WatchBridgeService : Service() {
                         val json = JSONObject(body.ifEmpty { "{}" })
                         val cmd = json.optString("command", "")
                         val outcome = controlDispatcher.executeCommand(cmd)
-                        _telemetry.value = _telemetry.value.copy(lastControlAction = outcome)
+                        _telemetry.update { current -> current.copy(lastControlAction = outcome) }
                         logEvent("Watch Control → $outcome")
                         """{"status":"executed","action":"$outcome"}"""
                     }
@@ -882,35 +1051,51 @@ class WatchBridgeService : Service() {
 
             if (payload.controlCommand.isNotBlank()) {
                 val res = controlDispatcher.executeCommand(payload.controlCommand)
-                _telemetry.value = _telemetry.value.copy(lastControlAction = res)
+                _telemetry.update { current -> current.copy(lastControlAction = res) }
             }
 
-            val advance = BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
-            if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
-                advance.baseline != BridgePolicy.NO_STEP_BASELINE
-            ) {
-                logEvent("Step baseline established at ${advance.baseline}")
+            // Read-compute-persist under one lock: with up to 8 handlers in flight, two
+            // webhooks could otherwise both advance the baseline from the same stale
+            // value, dropping or double-counting a delta.
+            val advance = synchronized(stepBaselineLock) {
+                val today = LocalDate.now().toEpochDay()
+                if (baselineEpochDay != today) {
+                    // Midnight rollover while the service stayed alive: the watch's
+                    // counter restarted, so yesterday's baseline must be dropped rather
+                    // than swallowing the new day's steps.
+                    logEvent("Step baseline reset for a new day (was ${lastCumulativeSteps})")
+                    lastCumulativeSteps = BridgePolicy.NO_STEP_BASELINE
+                    baselineEpochDay = today
+                }
+                val advanced = BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
+                if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
+                    advanced.baseline != BridgePolicy.NO_STEP_BASELINE
+                ) {
+                    logEvent("Step baseline established at ${advanced.baseline}")
+                }
+                lastCumulativeSteps = advanced.baseline
+                persistStepBaseline(this, advanced.baseline, today)
+                advanced
             }
-            lastCumulativeSteps = advance.baseline
-            persistStepBaseline(this, advance.baseline, LocalDate.now().toEpochDay())
 
             val writtenCount = healthManager.writeTelemetryPayload(payload, advance.delta)
 
-            val cur = _telemetry.value
-            _telemetry.value = cur.copy(
-                heartRateBpm = if (payload.heartRate > 0) payload.heartRate else cur.heartRateBpm,
-                stepsToday = if (payload.steps >= 0) payload.steps else cur.stepsToday,
-                distanceMeters = if (payload.distanceMeters >= 0) payload.distanceMeters else cur.distanceMeters,
-                activeKcal = if (payload.activeCalories >= 0) payload.activeCalories else cur.activeKcal,
-                spo2Percent = if (payload.spo2 >= 0) payload.spo2 else cur.spo2Percent,
-                floorsClimbed = if (payload.floorsClimbed >= 0) payload.floorsClimbed else cur.floorsClimbed,
-                hrvRmssdMs = if (payload.hrvMs > 0) payload.hrvMs else cur.hrvRmssdMs,
-                restingHrBpm = if (payload.restingHeartRate > 0) payload.restingHeartRate else cur.restingHrBpm,
-                respiratoryRateBrpm = if (payload.respiratoryRate > 0) payload.respiratoryRate else cur.respiratoryRateBrpm,
-                sleepMinutes = if (payload.sleepMinutes >= 0) payload.sleepMinutes else cur.sleepMinutes,
-                batteryPercent = if (payload.battery in 0..100) payload.battery else cur.batteryPercent,
-                healthConnectSyncedCount = cur.healthConnectSyncedCount + writtenCount
-            )
+            _telemetry.update { cur ->
+                cur.copy(
+                    heartRateBpm = if (payload.heartRate > 0) payload.heartRate else cur.heartRateBpm,
+                    stepsToday = if (payload.steps >= 0) payload.steps else cur.stepsToday,
+                    distanceMeters = if (payload.distanceMeters >= 0) payload.distanceMeters else cur.distanceMeters,
+                    activeKcal = if (payload.activeCalories >= 0) payload.activeCalories else cur.activeKcal,
+                    spo2Percent = if (payload.spo2 >= 0) payload.spo2 else cur.spo2Percent,
+                    floorsClimbed = if (payload.floorsClimbed >= 0) payload.floorsClimbed else cur.floorsClimbed,
+                    hrvRmssdMs = if (payload.hrvMs > 0) payload.hrvMs else cur.hrvRmssdMs,
+                    restingHrBpm = if (payload.restingHeartRate > 0) payload.restingHeartRate else cur.restingHrBpm,
+                    respiratoryRateBrpm = if (payload.respiratoryRate > 0) payload.respiratoryRate else cur.respiratoryRateBrpm,
+                    sleepMinutes = if (payload.sleepMinutes >= 0) payload.sleepMinutes else cur.sleepMinutes,
+                    batteryPercent = if (payload.battery in 0..100) payload.battery else cur.batteryPercent,
+                    healthConnectSyncedCount = cur.healthConnectSyncedCount + writtenCount
+                )
+            }
             logEvent("Webhook committed $writtenCount Health Connect records")
         } catch (e: Exception) {
             logEvent("Webhook JSON Error: ${e.message}")
@@ -921,23 +1106,34 @@ class WatchBridgeService : Service() {
         serviceScope.launch {
             while (isActive) {
                 delay(15_000L)
-                if (hrSampleBuffer.isNotEmpty()) {
-                    val copy = synchronized(hrSampleBuffer) {
-                        val list = hrSampleBuffer.toList()
-                        hrSampleBuffer.clear()
-                        list
-                    }
-                    try {
-                        val count = healthManager.flushHeartRateSamples(copy)
-                        if (count > 0) {
-                            _telemetry.value = _telemetry.value.copy(
-                                healthConnectSyncedCount = _telemetry.value.healthConnectSyncedCount + count
+                // Take a snapshot but do NOT clear it yet. `flushHeartRateSamples`
+                // returns 0 without throwing when Health Connect is unavailable, so
+                // draining first silently discarded every sample of the interval, once
+                // per 15 s, forever. Samples are removed only as they are confirmed.
+                val snapshot = synchronized(hrSampleBuffer) { hrSampleBuffer.toList() }
+                if (snapshot.isEmpty()) continue
+                try {
+                    val count = healthManager.flushHeartRateSamples(snapshot)
+                    if (count > 0) {
+                        synchronized(hrSampleBuffer) { hrSampleBuffer.removeAll(snapshot) }
+                        _telemetry.update { current ->
+                            current.copy(
+                                healthConnectSyncedCount =
+                                    current.healthConnectSyncedCount + count
                             )
-                            logEvent("Flushed live BLE HR batch → $count record(s) in Health Connect")
                         }
-                    } catch (e: Exception) {
-                        logEvent("HC Flush Error: ${e.message}")
+                        logEvent("Flushed live BLE HR batch → $count record(s) in Health Connect")
+                    } else if (!healthManager.isAvailable) {
+                        // Health Connect missing/disabled: keep buffering and say so once
+                        // per interval instead of dropping the data silently.
+                        logEvent(
+                            "Health Connect unavailable — retaining ${snapshot.size} buffered " +
+                                "heart-rate sample(s)"
+                        )
                     }
+                } catch (e: Exception) {
+                    // Samples stay buffered and are retried on the next interval.
+                    logEvent("HC Flush Error (will retry): ${e.message}")
                 }
             }
         }

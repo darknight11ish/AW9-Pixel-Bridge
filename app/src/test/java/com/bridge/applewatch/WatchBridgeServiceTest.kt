@@ -189,6 +189,62 @@ class WatchBridgeServiceTest {
         )
     }
 
+    @Test
+    fun `the persisted-token probe is truthful before the service starts`() {
+        // The dashboard used to read the service's static `authToken`, which only
+        // loadAuthToken() inside onCreate populates. Before the service started — or
+        // permanently, if the Bluetooth permission was denied so it never started — the
+        // card wrongly claimed "No Token Set" while a token was stored and enforced.
+        assertFalse("nothing persisted yet", WatchBridgeService.hasPersistedAuthToken(context))
+
+        WatchBridgeService.setAuthToken(context, "pixel-secret")
+        // Drop the static to prove the probe reads storage rather than memory.
+        WatchBridgeService.authTokenForTestReset()
+        assertNull("the in-memory copy is gone", WatchBridgeService.authToken)
+        assertTrue(
+            "the probe must still see the persisted token",
+            WatchBridgeService.hasPersistedAuthToken(context)
+        )
+
+        WatchBridgeService.clearAuthToken(context)
+        assertFalse(WatchBridgeService.hasPersistedAuthToken(context))
+    }
+
+    @Test
+    fun `an oversized declared body is refused without allocating for it`() {
+        // The body buffer used to be sized from the client-supplied Content-Length before
+        // a single byte was read, so this request allocated ~2 GB and killed the process
+        // with an OutOfMemoryError (an Error, so the handler's `catch (e: Exception)`
+        // never saw it). No body is sent: the refusal must happen first.
+        val response = rawRequest(
+            "POST /telemetry HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: 2000000000\r\n" +
+                "\r\n"
+        )
+        assertNotNull("expected a response (last error: ${socketError.get()})", response)
+        assertTrue(
+            "expected 413 Payload Too Large, got: ${response!!.take(40)}",
+            response.startsWith("HTTP/1.1 413")
+        )
+    }
+
+    @Test
+    fun `an oversized header block is refused`() {
+        // An endless header line would otherwise grow the reader's buffer without limit:
+        // the socket timeout bounds idle time, not total bytes.
+        val hugeHeader = "X-Filler: " + "a".repeat(8 * 1024 + 1)
+        val response = rawRequest(
+            "GET /status HTTP/1.1\r\nHost: 127.0.0.1\r\n$hugeHeader\r\n\r\n"
+        )
+        assertNotNull("expected a response (last error: ${socketError.get()})", response)
+        assertTrue(
+            "expected 431 Request Header Fields Too Large, got: ${response!!.take(40)}",
+            response.startsWith("HTTP/1.1 431")
+        )
+    }
+
     // ------------------------------------------------- HTTP hardening (OPEN-03)
 
     @Test
@@ -443,8 +499,9 @@ class WatchBridgeServiceTest {
      * because relying on the server's `close()` to signal end-of-stream behaved
      * differently on the Linux CI runner than on the development host.
      */
-    private fun rawRequest(request: String): String? {
-        val port = startBridgeIfNeeded()
+    private fun rawRequest(request: String): String? = rawRequest(startBridgeIfNeeded(), request)
+
+    private fun rawRequest(port: Int, request: String): String? {
         return try {
             rawRequestOnce(port, request)
         } catch (e: Exception) {

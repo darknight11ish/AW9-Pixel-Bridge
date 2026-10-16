@@ -37,6 +37,26 @@ class HealthConnectManager(context: Context) {
          */
         const val BATCH_CHUNK_SIZE = 500
 
+        /** Upper bound on a plausible sleep duration, in minutes (72 hours). */
+        const val MAX_SLEEP_MINUTES = 72L * 60L
+
+        /**
+         * Upper bounds imposed by Health Connect's own record constructors.
+         *
+         * These were established by probing the resolved 1.1.0 artifact rather than from
+         * documentation: `HeartRateVariabilityRmssdRecord` rejects > 200 ms,
+         * `StepsRecord` > 1,000,000, and distance/energy/floors > 1,000,000 of their
+         * unit. Exceeding any of them throws `IllegalArgumentException` *when the record
+         * is constructed*, which means one bad value in a payload rejected the whole
+         * batch and lost every valid record alongside it. Each metric is therefore
+         * range-checked here, before construction.
+         */
+        const val MAX_HRV_MS = 200.0
+        const val MAX_STEPS = 1_000_000L
+        const val MAX_DISTANCE_METERS = 1_000_000.0
+        const val MAX_ACTIVE_CALORIES = 1_000_000.0
+        const val MAX_FLOORS = 1_000_000.0
+
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getWritePermission(HeartRateRecord::class),
             HealthPermission.getReadPermission(HeartRateRecord::class),
@@ -97,7 +117,10 @@ class HealthConnectManager(context: Context) {
             time = timestamp,
             zoneOffset = offset,
             heartRateVariabilityMillis = rmssdMs,
-            metadata = Metadata.manualEntry(clientRecordId = "aw9_hrv_${timestamp.epochSecond}")
+            // Millisecond granularity: this is called once per HR notification carrying
+            // RR intervals, and a second-granular id made two bursts in the same second
+            // share one record key, so one HRV value replaced the other (D-07).
+            metadata = Metadata.manualEntry(clientRecordId = "aw9_hrv_${timestamp.toEpochMilli()}")
         )
         hc.insertRecords(listOf(record))
     }
@@ -108,6 +131,32 @@ class HealthConnectManager(context: Context) {
         now: Instant = Instant.now()
     ): Int {
         val hc = client ?: return 0
+        val records = buildTelemetryRecords(payload, stepDelta, now)
+        if (records.isNotEmpty()) {
+            return insertAndCount(hc, records)
+        }
+        return 0
+    }
+
+    /**
+     * Builds the records a telemetry payload should produce, applying every range and
+     * sentinel gate.
+     *
+     * This is the write layer's safety surface: each guard here is what stops a
+     * sentinel (`-1.0`, `0`, absent) or an out-of-range reading from becoming a
+     * fabricated clinical record. It is deliberately separate from the insert so the
+     * gates can be exercised directly — they were previously reachable only through a
+     * live Health Connect client, which unit tests cannot construct, so the whole
+     * contract went untested.
+     *
+     * `internal` rather than public: same module, so tests can call it, but not part of
+     * the app's surface.
+     */
+    internal fun buildTelemetryRecords(
+        payload: WebhookTelemetryPayload,
+        stepDelta: Long,
+        now: Instant = Instant.now()
+    ): List<Record> {
         val offset = ZoneOffset.systemDefault().rules.getOffset(now)
         val windowStart = now.minusSeconds(60)
         val records = mutableListOf<Record>()
@@ -129,15 +178,23 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (stepDelta > 0) {
+        if (stepDelta in 1..MAX_STEPS) {
             // Steps are interval data. Bucketing into a fixed hourly window keeps
             // Health Connect aggregation meaningful instead of turning every delta
             // into a 60-second spike (D-07b).
+            //
+            // The record id must still be unique per delta. Health Connect keys records
+            // by `clientRecordId`, so using the *window* as the id made every delta in
+            // the same hour collide, and only one of them survived (replace) or was
+            // kept (ignore) — the hour never accumulated its steps. Each delta is
+            // therefore written as its own interval inside the hour, which Health
+            // Connect sums, while the window keeps the aggregation shape.
             val bucketStart = Instant.ofEpochSecond(
                 BridgePolicy.stepWindowStart(now.epochSecond)
             )
             val bucketEnd = bucketStart.plusSeconds(BridgePolicy.STEP_WINDOW_SECONDS)
             val bucketOffset = ZoneOffset.systemDefault().rules.getOffset(bucketStart)
+            val stepWindowStamp = now.toEpochMilli()
             records.add(
                 StepsRecord(
                     startTime = bucketStart,
@@ -146,13 +203,13 @@ class HealthConnectManager(context: Context) {
                     endZoneOffset = bucketOffset,
                     count = stepDelta,
                     metadata = Metadata.manualEntry(
-                        clientRecordId = "aw9_steps_${bucketStart.epochSecond}"
+                        clientRecordId = "aw9_steps_${stepWindowStamp}_$stepDelta"
                     )
                 )
             )
         }
 
-        if (payload.distanceMeters > 0.0) {
+        if (payload.distanceMeters > 0.0 && payload.distanceMeters <= MAX_DISTANCE_METERS) {
             records.add(
                 DistanceRecord(
                     startTime = windowStart,
@@ -165,7 +222,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.activeCalories > 0.0) {
+        if (payload.activeCalories > 0.0 && payload.activeCalories <= MAX_ACTIVE_CALORIES) {
             records.add(
                 ActiveCaloriesBurnedRecord(
                     startTime = windowStart,
@@ -189,7 +246,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.floorsClimbed > 0.0) {
+        if (payload.floorsClimbed > 0.0 && payload.floorsClimbed <= MAX_FLOORS) {
             records.add(
                 FloorsClimbedRecord(
                     startTime = windowStart,
@@ -202,7 +259,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.hrvMs in 1.0..250.0) {
+        if (payload.hrvMs in 1.0..MAX_HRV_MS) {
             records.add(
                 HeartRateVariabilityRmssdRecord(
                     time = now,
@@ -235,7 +292,10 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.sleepMinutes > 0L) {
+        // Bounded on purpose: an unbounded value overflows `sleepMinutes * 60`
+        // (Long.MAX_VALUE * 60 == -60), which would place the session's start *after*
+        // its end and fail the whole insert. 72 hours is longer than any real sleep.
+        if (payload.sleepMinutes in 1..MAX_SLEEP_MINUTES) {
             val sleepStart = now.minusSeconds(payload.sleepMinutes * 60)
             records.add(
                 SleepSessionRecord(
@@ -243,16 +303,13 @@ class HealthConnectManager(context: Context) {
                     startZoneOffset = offset,
                     endTime = now,
                     endZoneOffset = offset,
-                    title = "Apple Watch Series 9 Sleep",
+                    title = "Sleep (imported by AW9 Pixel Bridge)",
                     metadata = Metadata.manualEntry(clientRecordId = "aw9_sleep_${sleepStart.epochSecond}")
                 )
             )
         }
 
-        if (records.isNotEmpty()) {
-            return insertAndCount(hc, records)
-        }
-        return 0
+        return records
     }
 
     /**
@@ -287,22 +344,24 @@ class HealthConnectManager(context: Context) {
 }
 
 /**
- * The number of records the provider committed for this insert.
+ * How many record ids the provider returned for this insert.
  *
- * `InsertRecordsResponse.recordIdsList` is the only way to learn how many records were
- * actually written rather than merely submitted, since Health Connect may replace or
- * ignore records that share a `clientRecordId`. The accessor is annotated `@RestrictTo`,
- * i.e. it is not part of the stable public contract (OPEN-04), so it is isolated here
- * behind one function instead of leaking through the manager:
+ * `InsertRecordsResponse.recordIdsList` is annotated `@RestrictTo`, i.e. it is not part
+ * of the stable public contract (OPEN-04), so it is used in exactly one place instead of
+ * leaking through the manager:
  *
- * - [@SuppressLint] documents the deliberate non-contract use so the lint gate stays
+ * - [@SuppressLint] documents the deliberate non-contract use, so the lint gate stays
  *   meaningful for every *other* RestrictedApi reference in this module.
- * - If a future `connect-client` removes or renames the accessor, [runCatching] means
- *   the sync degrades to the conservative [fallback] (the submitted count) instead of
- *   crashing the service mid-insert.
+ * - [runCatching] means a future `connect-client` that removes or renames the accessor
+ *   degrades to [fallback] (the submitted count) instead of crashing the service
+ *   mid-insert. Callers must pass the submitted count so the fallback cannot silently
+ *   report 0.
  *
- * Callers must pass the number of records submitted so the fallback cannot silently
- * report 0, which would make a successful sync look like a no-op.
+ * **Honest limitation:** on success this list carries one id per *submitted* record,
+ * including records that replaced an existing `clientRecordId`, so it cannot distinguish
+ * an insert from an upsert. The returned count is therefore "records accepted", not
+ * "rows newly created" — the dashboard counter accumulates replacements too. Fully
+ * closing D-07 would need local bookkeeping of already-written ids.
  */
 @SuppressLint("RestrictedApi")
 private fun InsertRecordsResponse.committedCount(fallback: Int): Int =

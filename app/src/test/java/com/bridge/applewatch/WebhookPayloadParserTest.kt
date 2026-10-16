@@ -66,7 +66,7 @@ class WebhookPayloadParserTest {
               "walking_running_distance": 2.4,
               "blood_oxygen_saturation": 0.985,
               "flights_climbed": 7,
-              "heart_rate_variability": 38.0,
+              "hrv_rmssd": 38.0,
               "resting_heart_rate": 50,
               "respiratory_rate": 13.5,
               "sleep_minutes": 420,
@@ -100,13 +100,46 @@ class WebhookPayloadParserTest {
     @Test
     fun `bpm and spo2 percent aliases are honoured`() {
         val payload = WebhookPayloadParser.parse(
-            """{"bpm":71,"oxygen_saturation":98.0,"hrv_sdnn":35.0,"active_calories":15.0}"""
+            """{"bpm":71,"oxygen_saturation":98.0,"active_calories":15.0}"""
         )
         assertEquals(71, payload.heartRate)
         // Already a percentage: it must NOT be multiplied again.
         assertEquals(98.0, payload.spo2, 1e-9)
-        assertEquals(35.0, payload.hrvMs, 1e-9)
         assertEquals(15.0, payload.activeCalories, 1e-9)
+    }
+
+    @Test
+    fun `SDNN-named keys never populate the RMSSD field`() {
+        // Apple's HRV is SDNN; Health Connect's only HRV record type stores RMSSD. The
+        // XML importer gates SDNN (D-05), but the JSON paths accepted SDNN names and the
+        // manager wrote them as HeartRateVariabilityRmssdRecord — a mislabelled clinical
+        // record. Those aliases are now rejected; only genuinely RMSSD-named keys map.
+        listOf(
+            """{"hrv_sdnn":35.0}""",
+            """{"heart_rate_variability":35.0}""",
+            """{"heart_rate_variability_sdnn":35.0}"""
+        ).forEach { body ->
+            assertEquals(
+                "$body must not become RMSSD",
+                -1.0,
+                WebhookPayloadParser.parse(body).hrvMs,
+                1e-9
+            )
+        }
+
+        // Health Auto Export's nested SDNN metric is rejected the same way.
+        assertEquals(
+            -1.0,
+            WebhookPayloadParser.parse(
+                """{"data":{"metrics":[{"name":"heart_rate_variability_sdnn","units":"ms","data":[{"qty":45}]}]}}"""
+            ).hrvMs,
+            1e-9
+        )
+
+        // RMSSD-named keys still work.
+        assertEquals(35.0, WebhookPayloadParser.parse("""{"hrv_rmssd":35.0}""").hrvMs, 1e-9)
+        assertEquals(35.0, WebhookPayloadParser.parse("""{"rmssd":35.0}""").hrvMs, 1e-9)
+        assertEquals(35.0, WebhookPayloadParser.parse("""{"hrv":35.0}""").hrvMs, 1e-9)
     }
 
     // ------------------------------------------ schema 3: Health Auto Export JSON
@@ -383,6 +416,65 @@ class WebhookPayloadParserTest {
             "FIND_MY_PIXEL",
             WebhookPayloadParser.parse("""{"ring_pixel":true}""").controlCommand
         )
+    }
+
+    @Test
+    fun `non-finite numbers are rejected rather than poisoning a gate`() {
+        // `toDoubleOrNull("1e999")` returns Infinity, which passes every `> 0.0` gate
+        // and would construct an infinite Length/Energy record; `Infinity.toLong()`
+        // saturates to Long.MAX_VALUE, which then poisons the persisted step baseline so
+        // every later step delta becomes 0.
+        val payload = WebhookPayloadParser.parse(
+            """{"distanceMeters":"1e999","activeCalories":1e999,"steps":"1e999","spo2":1e999}"""
+        )
+        val expected = WebhookTelemetryPayload()
+        assertEquals("infinities must be treated as absent", expected, payload)
+
+        // NaN is also rejected.
+        assertEquals(expected, WebhookPayloadParser.parse("""{"heartRate":"NaN"}"""))
+    }
+
+    @Test
+    fun `sleep analysis durations are hours and are converted to minutes`() {
+        // Health Auto Export documents sleep_analysis with units "hr"; reading it as
+        // minutes turned a 7.5-hour night into a 7-minute session.
+        val hours = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"sleep_analysis","units":"hr","data":[{"qty":7.5}]}]}}"""
+        )
+        assertEquals("7.5 hours must become 450 minutes", 450L, hours.sleepMinutes)
+
+        // The native minutes field keeps its meaning and is never scaled.
+        val minutes = WebhookPayloadParser.parse("""{"sleepMinutes":420}""")
+        assertEquals(420L, minutes.sleepMinutes)
+
+        // Shortcuts' explicit hours alias behaves the same way.
+        assertEquals(90L, WebhookPayloadParser.parse("""{"sleep_hours":1.5}""").sleepMinutes)
+    }
+
+    @Test
+    fun `distance and energy honour the exporter's units`() {
+        // Health Auto Export's unit preferences are per-metric, so a mi/kJ payload must
+        // not be written with a metres/kcal magnitude.
+        val miles = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"walking_running_distance","units":"mi","data":[{"qty":3.1}]}]}}"""
+        )
+        assertEquals(3.1 * 1609.344, miles.distanceMeters, 1e-6)
+
+        val kilojoules = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"active_energy","units":"kJ","data":[{"qty":1000}]}]}}"""
+        )
+        assertEquals(1000.0 / 4.184, kilojoules.activeCalories, 1e-6)
+
+        val metres = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"walking_running_distance","units":"m","data":[{"qty":900}]}]}}"""
+        )
+        assertEquals(900.0, metres.distanceMeters, 1e-9)
+
+        // An unrecognised unit is skipped rather than guessed.
+        val unknown = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"walking_running_distance","units":"furlongs","data":[{"qty":9}]}]}}"""
+        )
+        assertEquals(-1.0, unknown.distanceMeters, 1e-9)
     }
 
     @Test
