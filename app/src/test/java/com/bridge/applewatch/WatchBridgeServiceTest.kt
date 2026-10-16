@@ -352,11 +352,37 @@ class WatchBridgeServiceTest {
      * The body is read by its declared `Content-Length` rather than by reading to EOF:
      * relying on the server's `close()` to signal end-of-stream is timing dependent and
      * behaved differently on the Linux CI runner than on the development host.
+     *
+     * A connection or read timeout is retried a few times. The server releases the
+     * accepted socket and its semaphore permit asynchronously, and a loaded CI runner
+     * can make a second request arrive while the first connection is still winding
+     * down. Only timeouts are retried, so a server that answers incorrectly still
+     * fails the assertions.
      */
-    private fun rawRequest(port: Int, request: String): String? = try {
+    private fun rawRequest(port: Int, request: String): String? {
+        var lastError: Exception? = null
+        for (attempt in 1..3) {
+            try {
+                return rawRequestOnce(port, request)
+            } catch (e: java.net.SocketTimeoutException) {
+                lastError = e
+                Thread.sleep(150L * attempt)
+            } catch (e: java.net.ConnectException) {
+                lastError = e
+                Thread.sleep(150L * attempt)
+            } catch (e: Exception) {
+                lastSocketError = "${e.javaClass.name}: ${e.message}"
+                return null
+            }
+        }
+        lastSocketError = "${lastError?.javaClass?.name}: ${lastError?.message} (after 3 attempts)"
+        return null
+    }
+
+    private fun rawRequestOnce(port: Int, request: String): String {
         Socket().use { socket ->
             socket.connect(InetSocketAddress("127.0.0.1", port), 3_000)
-            socket.soTimeout = 5_000
+            socket.soTimeout = 8_000
             // Deliberately not closed with `use`: closing the writer closes the
             // underlying socket, so the response could never be read back.
             val out = PrintWriter(socket.getOutputStream(), true)
@@ -386,11 +412,8 @@ class WatchBridgeServiceTest {
                 }
                 headers.append("\r\n").append(String(body, 0, total))
             }
-            headers.toString()
+            return headers.toString()
         }
-    } catch (e: Exception) {
-        lastSocketError = "${e.javaClass.name}: ${e.message}"
-        null
     }
 
     private var lastSocketError: String = "none"

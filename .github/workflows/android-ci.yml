@@ -118,12 +118,34 @@ jobs:
             watchos-companion/WatchBridgeAgent.swift
           echo "watchOS 10 type-check passed"
 
-      - name: Build the generated watchOS project
-        # The type-check above proves the Swift compiles; this proves the XcodeGen spec
-        # actually produces a buildable app, which is the part `project.yml` claims.
+      - name: Verify the generated project format and build it
+        # The type-check above is the authoritative Swift gate. This step additionally
+        # proves the XcodeGen spec produces a project this runner's Xcode can consume.
+        #
+        # XcodeGen's Homebrew build defaults to the newest object format it knows
+        # (objectVersion 77, the Xcode 16 format), which the macos-14 image's Xcode 15.4
+        # refuses outright: "cannot be opened because it is in a future Xcode project
+        # file format (77)". project.yml pins objectVersion 56 for that reason. The pin
+        # is verified here rather than assumed, so a regression (or a future XcodeGen
+        # that ignores the option) fails loudly with a clear message instead of a
+        # confusing build error.
         run: |
           set -o pipefail
           cd watchos-companion
+          OBJECT_VERSION="$(sed -n 's/.*objectVersion = \([0-9]*\);.*/\1/p' \
+            WatchBridgeAgent.xcodeproj/project.pbxproj | head -n 1)"
+          XCODE_MAJOR="$(xcodebuild -version | head -n 1 | sed 's/Xcode //' | cut -d. -f1)"
+          echo "Generated objectVersion: ${OBJECT_VERSION:-unknown}"
+          echo "Runner Xcode: $XCODE_MAJOR"
+          if [ -z "$OBJECT_VERSION" ]; then
+            echo "::error::could not read objectVersion from the generated project"
+            exit 1
+          fi
+          if [ "$OBJECT_VERSION" -gt 60 ]; then
+            echo "::error::project.yml must pin a project format Xcode $XCODE_MAJOR can open;" \
+                 "generated objectVersion=$OBJECT_VERSION is too new."
+            exit 1
+          fi
           xcodebuild -project WatchBridgeAgent.xcodeproj \
             -scheme WatchBridgeAgent \
             -destination 'generic/platform=watchOS' \
