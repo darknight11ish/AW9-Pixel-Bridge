@@ -47,7 +47,7 @@ tests, because the test environment could not make the health-write call fail.
 | Platform | Android 14+ (`minSdk 34`, `targetSdk 35`); watchOS 10 companion |
 | Stack | Kotlin, Jetpack Compose, Health Connect `connect-client:1.1.0`, Gradle 8.11.1, AGP 8.9.1, JDK 17 |
 | Releases | `v1.2.0`, `v1.2.1`, `v1.2.2`, `v1.2.3` — all published with `app-debug.apk` and `app-release.apk` |
-| Current source | `main` at `aa19108` / tag `v1.2.4` |
+| Current source | `main` at the `v1.2.5` merge / tag `v1.2.5` |
 | Final state | **130 unit tests**, Android Lint **0 errors**, both CI jobs green, working tree clean |
 
 ### 2.1 Release ledger (all verified from the GitHub API, not from notes)
@@ -59,6 +59,7 @@ tests, because the test environment could not make the health-write call fail.
 | `v1.2.2` | `d9860c7` | 2026-10-16 20:57 | 2,518,256 B | 115 |
 | `v1.2.3` | `c753132` | 2026-10-17 07:57 | 2,534,644 B | 125 |
 | `v1.2.4` | `aa19108` | 2026-10-17 09:38 | 2,534,644 B | 130 |
+| `v1.2.5` | `0da58e9` | 2026-10-17 10:34 | see release | 130 |
 
 `v1.2.1`/`v1.2.2` and `v1.2.3`/`v1.2.4` have release APKs of **identical byte length but different
 SHA-256**;
@@ -67,7 +68,7 @@ and absent at `v1.2.1`), so this is a size coincidence, not a mis-published arti
 
 ### 2.2 Codebase metrics
 
-54 tracked files, 1,364,775 bytes, 20,360 lines (reproducible via `scripts/verify_repo_metrics.py`).
+56 tracked files, 1,375,665 bytes, 20,472 lines (reproducible via `scripts/verify_repo_metrics.py`).
 
 ---
 
@@ -553,3 +554,75 @@ severity accuracy are different things.
 name the behaviour they pin, so a regression cannot be renamed away from its assertion — the
 lesson from the `hrv is gated to the 1 to 250 range` incident in §5.2.
 
+---
+
+## 15. `v1.2.5` — a release-pipeline defect found only by installing a release
+
+This round began as bookkeeping — deploy the published `v1.2.4` to the phone so the device
+matched the artifact — and immediately failed:
+
+```
+adb: failed to install app-release.apk: Failure
+[INSTALL_FAILED_UPDATE_INCOMPATIBLE: Existing package com.bridge.applewatch
+ signatures do not match newer version; ignoring!]
+```
+
+### 15.1 Root cause
+
+The `release` build type was signed with `signingConfigs.getByName("debug")`. **Gradle
+generates a debug keystore on demand**, so every CI runner produced its own key. Three
+distinct certificates were measured:
+
+| Build | Certificate SHA-256 |
+|---|---|
+| `v1.2.3` (published) | `f7dbfda60e79d1470f5ebdd71e88d7e367b2c49ce4b8b8fafd5fcca4931ba476` |
+| `v1.2.4` (published) | `42a41c9428a4654e95d29c8cd8348dd783f7b1942ab6131da7c973671c63069c` |
+| local build | `62ef7742e35e742a94a071bba83631fd6db78b5b50961f7b45719d736500d7b5` |
+
+Consequence: **no release could ever update the previous one.** Every upgrade required an
+uninstall, which discards the bridge token and the persisted step baseline.
+
+### 15.2 Why four mechanisms missed it
+
+| Mechanism | Why not |
+|---|---|
+| Unit tests | Never install anything |
+| CI | Builds both APKs and uploads them, but never installs one over another |
+| Three adversarial audits | Read-only; no artifact is ever signed or installed |
+| Field test (§6) | Installed a **locally built** APK, not a published one — and always after an uninstall, so a signature mismatch could not surface |
+
+The only thing that could find it was **installing a published artifact over an existing
+install**. That step had never been performed in four releases.
+
+It also exposes a gap in this document's own method: §6 verified behaviour on the device, but
+verified it against a locally built binary. "It works on the device" and "the release artifact
+works on the device" are different claims, and only the first had been checked.
+
+### 15.3 Fix
+
+A fixed, repository-committed sideload key (`ci/sideload.keystore`), used by CI **and** local
+builds, password documented because the key is public, with `ci/README.md` stating that it must
+never be used for a Play upload and that rotating it means no installed build will upgrade
+again. Bumped to `v1.2.5` / `versionCode 10`.
+
+### 15.4 Verification
+
+```
+CI-published v1.2.5 certificate : d1c1602825393a180791b78c17f27f3cee8cd41a32597512260ac3648e528101
+local build certificate         : d1c1602825393a180791b78c17f27f3cee8cd41a32597512260ac3648e528101
+
+install published v1.2.5            -> Success
+install local build OVER it         -> Success
+```
+
+The last line is the property that was broken: cross-source, in-place upgrade now works.
+One-off cost: any build already installed from the throwaway-key releases needs a single
+uninstall to reach this lineage.
+
+### 15.5 The generalisable lesson
+
+Every round in this document found its best defect in the mechanism the previous round did not
+use (§14.3), and this round extends the pattern to the last step of the pipeline: **building,
+signing and publishing are not the same as shipping.** A release artifact has properties —
+signature, upgrade path, installability — that exist only when it is installed over an existing
+one, and none of the four earlier mechanisms ever did that.
