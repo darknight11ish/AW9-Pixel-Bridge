@@ -26,6 +26,7 @@ Four releases in roughly one day of work, each driven by a different discovery m
 | `v1.2.1` | **Three independent adversarial audits** | 113 | 45 findings; two defects that had shipped silently since `v1.0.x` |
 | `v1.2.2` | A **fourth audit** narrowed to one question | 115 | 4 high-severity data-integrity defects, one of them in the `v1.2.1` fix itself |
 | `v1.2.3` | **The first physical-device field test** | 125 | 4 defects that 115 passing tests could not reach |
+| `v1.2.4` | **An external review of this document** | 130 | Read-back verification; 4 verified fixes, 1 falsified claim |
 
 The pattern is the interesting part, and it is consistent: **each round's most valuable
 finding came from a mechanism the previous round did not use.** Reading the code found some.
@@ -46,8 +47,8 @@ tests, because the test environment could not make the health-write call fail.
 | Platform | Android 14+ (`minSdk 34`, `targetSdk 35`); watchOS 10 companion |
 | Stack | Kotlin, Jetpack Compose, Health Connect `connect-client:1.1.0`, Gradle 8.11.1, AGP 8.9.1, JDK 17 |
 | Releases | `v1.2.0`, `v1.2.1`, `v1.2.2`, `v1.2.3` — all published with `app-debug.apk` and `app-release.apk` |
-| Current source | `main` at `c753132` / tag `v1.2.3` |
-| Final state | **125 unit tests**, Android Lint **0 errors**, both CI jobs green, working tree clean |
+| Current source | `main` at `aa19108` / tag `v1.2.4` |
+| Final state | **130 unit tests**, Android Lint **0 errors**, both CI jobs green, working tree clean |
 
 ### 2.1 Release ledger (all verified from the GitHub API, not from notes)
 
@@ -57,14 +58,16 @@ tests, because the test environment could not make the health-write call fail.
 | `v1.2.1` | `8f7d181` | 2026-10-16 19:29 | 2,518,256 B | 113 |
 | `v1.2.2` | `d9860c7` | 2026-10-16 20:57 | 2,518,256 B | 115 |
 | `v1.2.3` | `c753132` | 2026-10-17 07:57 | 2,534,644 B | 125 |
+| `v1.2.4` | `aa19108` | 2026-10-17 09:38 | 2,534,644 B | 130 |
 
-`v1.2.1` and `v1.2.2` have release APKs of **identical byte length but different SHA-256**;
+`v1.2.1`/`v1.2.2` and `v1.2.3`/`v1.2.4` have release APKs of **identical byte length but different
+SHA-256**;
 each tag was verified to contain its own changes (e.g. `plausibleLong` is present at `v1.2.2`
 and absent at `v1.2.1`), so this is a size coincidence, not a mis-published artifact.
 
 ### 2.2 Codebase metrics
 
-53 tracked files, 1,295,720 bytes, 19,990 lines (reproducible via `scripts/verify_repo_metrics.py`).
+54 tracked files, 1,364,775 bytes, 20,360 lines (reproducible via `scripts/verify_repo_metrics.py`).
 
 ---
 
@@ -469,3 +472,84 @@ No claim in this document rests on any of the following, and none of it has been
 *Compiled from the repository at `c753132` (tag `v1.2.3`). Every release figure was read from the
 GitHub API; every defect claim was either reproduced by a failing observation or by a test that
 now pins it. Where a claim could not be verified it is listed in §9 rather than asserted.*
+
+---
+
+## 14. `v1.2.4` — acting on the external review of this document
+
+The review of this document approved `v1.2.3` and answered the eight questions in §11 with
+seven concrete recommendations. Each was verified before being acted on; two did not survive.
+
+| # | Recommendation | Action | Outcome |
+|---|---|---|---|
+| Q7 | Verify by **reading records back** from the provider, not just that `insert` returned | **Implemented** | First true end-to-end proof in this project (§14.1) |
+| Q6 | Summarized sleep (`totalSleep`, no `qty`) is silent data loss | **Implemented** | Verified on device: the shape now writes a record |
+| Q5 | Label records `autoRecorded` with a `TYPE_WATCH` `Device`, not `manualEntry` | **Implemented** | `Device`'s optional fields confirmed by compiling, not assumed |
+| Q1/Q2 | Keep `403`/`503`; add `Retry-After` | **Implemented** | `Retry-After: 30` on retryable failures |
+| Q8.1 | Back off and retry on `ERROR_RATE_LIMIT_EXCEEDED` | **Implemented** | Constant confirmed in the platform jar first |
+| Q4 | Keep the 350 ms RR filter, drop final values > 200 ms | **No change needed** | Code already did exactly this; verified |
+| Q3 | Content-derived webhook ids for idempotency | **Deferred deliberately** | Changes record identity on upgrade; needs a decision, not an edit |
+| Q8.3 | Add a `WifiLock` so screen-off delivery works | **Falsified, not implemented** | Tested: delivery did **not** fail with the screen off |
+
+### 14.1 The read-back verification is the most valuable outcome of the whole arc
+
+Every prior verification stopped at "the insert call returned". That is not the same as "the
+provider stored it": a `clientRecordId` collision upserts, and a rejected record disappears
+silently. `HealthConnectManager.countRecordsSince()` plus `GET /verify-hc` reads records back
+out of Health Connect, and this is what it showed on the OnePlus 10T:
+
+```
+POST /telemetry -> {"status":"synced","hcTotal":9,"hcWritten":9}
+
+GET  /verify-hc  -> {"heartRate":2,          // was 1 before the POST
+                     "steps":1, "distance":1, "activeCalories":1,
+                     "oxygenSaturation":1, "floorsClimbed":1, "restingHeartRate":1,
+                     "respiratoryRate":-1, "sleep":-1,
+                     "readBackTotal":8}
+```
+
+**Eight of nine submitted records were read back out of the provider.** `sleep` and
+`respiratoryRate` report `-1`, and the response carries an explicit `sentinelMeaning` saying
+so: the app deliberately holds only WRITE permission for those two types, so probing a read
+would otherwise be reported as a failure. That distinction is the difference between a
+diagnostic and a false alarm.
+
+### 14.2 A claim that did not survive testing
+
+The review rated a `WifiLock` as "critical for reliability", predicting that 2–5 minutes after
+the screen turns off the Wi-Fi chip enters power-save mode and drops TCP `SYN` packets on
+port 8484. This was tested directly:
+
+```
+screen off, mWakefulness=Dozing, deviceidle mState=ACTIVE, after 180 s
+
+POST /telemetry -> HTTP 200  connect=0.149s  total=0.223s   (record written)
+GET  /status    -> HTTP 200  total=0.050s
+```
+
+Delivery did not fail. No wake lock was added: it would cost battery to fix something not
+observed. The honest conclusion is bounded — three minutes of dozing on one OEM's build is
+not a proof that screen-off delivery never fails, and a longer test (or the Pixel 9) could
+still justify it. It is recorded here as *tested and not reproduced*, not as *disproved*.
+
+### 14.3 What this changes about the document's own conclusions
+
+§8 argued that each round's best finding came from a mechanism the previous round did not
+use. `v1.2.4` continues the pattern in an uncomfortable direction: the most valuable item
+came from **an external reader noticing that a whole category of verification was missing** —
+not from any of the four internal mechanisms. The lesson generalises: the gap was not "a
+defect nobody found", it was "a question nobody asked", and no amount of re-reading the code
+would have surfaced it.
+
+It also repeats the §7.1 lesson exactly. Of the review's recommendations, the one rated most
+severe (`WifiLock`) was the one that did not reproduce, and the ones rated as workmanlike
+(read-back, sleep shape, metadata) were the ones that mattered. Severity confidence and
+severity accuracy are different things.
+
+### 14.4 `v1.2.4` state
+
+**130 tests** (was 125: summarized sleep ×2, device-recorded metadata, `Retry-After`,
+`/verify-hc`), Android Lint 0 errors, both CI jobs green, release published. The 5 new tests
+name the behaviour they pin, so a regression cannot be renamed away from its assertion — the
+lesson from the `hrv is gated to the 1 to 250 range` incident in §5.2.
+
