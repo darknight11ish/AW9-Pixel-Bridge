@@ -14,12 +14,16 @@ import com.bridge.applewatch.MainActivity
 import com.bridge.applewatch.ble.BlePacketParser
 import com.bridge.applewatch.control.PixelControlDispatcher
 import com.bridge.applewatch.health.HealthConnectManager
+import com.bridge.applewatch.health.HealthDataSink
+import com.bridge.applewatch.health.HealthMetricRanges
+import com.bridge.applewatch.health.hasWritableHealthMetric
 import com.bridge.applewatch.health.WebhookPayloadParser
 import com.bridge.applewatch.model.WatchTelemetryState
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 import kotlinx.coroutines.sync.Semaphore
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -228,7 +232,20 @@ class WatchBridgeService : Service() {
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private lateinit var healthManager: HealthConnectManager
+    private lateinit var healthManager: HealthDataSink
+
+    /**
+     * A write sink installed by tests so the service's failure handling can be exercised.
+     * Production code never sets this.
+     */
+    private var testSink: HealthDataSink? = null
+
+    /** Test-only: replace the Health Connect sink before the service handles a request. */
+    @androidx.annotation.VisibleForTesting
+    internal fun overrideHealthSinkForTest(sink: HealthDataSink) {
+        testSink = sink
+        if (::healthManager.isInitialized) healthManager = sink
+    }
     private lateinit var controlDispatcher: PixelControlDispatcher
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bleScanner: BluetoothLeScanner? = null
@@ -319,7 +336,7 @@ class WatchBridgeService : Service() {
         val today = LocalDate.now().toEpochDay()
         lastCumulativeSteps = loadPersistedStepBaseline(this, today)
         baselineEpochDay = today
-        healthManager = HealthConnectManager(this)
+        healthManager = testSink ?: HealthConnectManager(this)
         controlDispatcher = PixelControlDispatcher(this, serviceScope)
 
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -988,26 +1005,47 @@ class WatchBridgeService : Service() {
                     return
                 }
 
-                val responseJson = when {
-                    method == "GET" && path.startsWith("/status") -> {
-                        val s = _telemetry.value
-                        """{"status":"online","bleConnected":${s.isBleConnected},"bpm":${s.heartRateBpm},"hcSynced":${s.healthConnectSyncedCount}}"""
-                    }
-                    method == "POST" && path.startsWith("/control") -> {
-                        val json = JSONObject(body.ifEmpty { "{}" })
-                        val cmd = json.optString("command", "")
-                        val outcome = controlDispatcher.executeCommand(cmd)
-                        _telemetry.update { current -> current.copy(lastControlAction = outcome) }
-                        logEvent("Watch Control → $outcome")
-                        """{"status":"executed","action":"$outcome"}"""
-                    }
-                    else -> {
-                        processWebhookTelemetryJson(body)
-                        """{"status":"synced","hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
-                    }
+                // Strict routing. The previous dispatch ended in a catch-all `else`
+                // that ran the full telemetry ingest, so `GET /`, `GET /unknown` and
+                // every unsupported method were answered as successful POSTs. Field
+                // testing confirmed this was not theoretical: a GET carrying a JSON body
+                // reached Health Connect and attempted a StepsRecord write.
+                val cleanPath = path.substringBefore('?').trimEnd('/').ifEmpty { "/" }
+                val outcome = when (cleanPath) {
+                    "/status" ->
+                        if (!method.equals("GET", ignoreCase = true)) {
+                            methodNotAllowed("GET, OPTIONS")
+                        } else {
+                            val st = _telemetry.value
+                            ok(
+                                """{"status":"online","bleConnected":${st.isBleConnected},""" +
+                                    """"bpm":${st.heartRateBpm},"hcSynced":${st.healthConnectSyncedCount}}"""
+                            )
+                        }
+
+                    "/control" ->
+                        if (!method.equals("POST", ignoreCase = true)) {
+                            methodNotAllowed("POST, OPTIONS")
+                        } else {
+                            handleControlRequest(body)
+                        }
+
+                    // "/" remains an alias for /telemetry: it is the shape the first
+                    // release documented, and existing Shortcuts may still post to it.
+                    "/telemetry", "/" ->
+                        if (!method.equals("POST", ignoreCase = true)) {
+                            methodNotAllowed("POST, OPTIONS")
+                        } else {
+                            processWebhookTelemetryJson(body)
+                        }
+
+                    else -> IngestOutcome(
+                        404, "Not Found",
+                        """{"status":"not_found","code":404,"path":${JSONObject.quote(cleanPath)}}"""
+                    )
                 }
 
-                writeResponse(writer, 200, "OK", responseJson)
+                writeResponse(writer, outcome.httpCode, outcome.reason, outcome.body)
             }
         } catch (e: Exception) {
             // A malformed request, a socket timeout or a peer that vanished mid-body
@@ -1046,85 +1084,184 @@ class WatchBridgeService : Service() {
         writer.flush()
     }
 
-    private suspend fun processWebhookTelemetryJson(rawBody: String) {
-        if (rawBody.isBlank()) return
-        try {
-            // All three supported dialects (native camelCase, Apple Shortcuts
-            // snake_case and Health Auto Export's nested metrics) are normalised by
-            // the parser, so this method no longer reads JSON keys itself. The
-            // legacy `findMyPixel: true` flag is likewise resolved to "FIND_MY_PIXEL".
-            val payload = WebhookPayloadParser.parse(rawBody)
+    /** The outcome of one HTTP request: the status to return plus its JSON body. */
+    private data class IngestOutcome(val httpCode: Int, val reason: String, val body: String)
 
-            if (payload.controlCommand.isNotBlank()) {
-                val res = controlDispatcher.executeCommand(payload.controlCommand)
-                _telemetry.update { current -> current.copy(lastControlAction = res) }
-            }
+    private fun ok(body: String) = IngestOutcome(200, "OK", body)
 
-            // Read-compute under one lock: with up to 8 handlers in flight, two webhooks
-            // could otherwise both advance the baseline from the same stale value,
-            // dropping or double-counting a delta.
-            //
-            // The baseline is NOT committed here. It used to be advanced *and persisted*
-            // before the Health Connect write, so if that write did nothing — Health
-            // Connect absent returns 0 without throwing — the delta was already consumed.
-            // Steps accrued during the outage were then unrecoverable, and because the
-            // baseline was persisted, a restart could not recover them either. The
-            // advance is prepared here and committed only once records were written.
-            val advance = synchronized(stepBaselineLock) {
-                val today = LocalDate.now().toEpochDay()
-                if (baselineEpochDay != today) {
-                    // Midnight rollover while the service stayed alive: the watch's
-                    // counter restarted, so yesterday's baseline must be dropped rather
-                    // than swallowing the new day's steps.
-                    logEvent("Step baseline reset for a new day (was ${lastCumulativeSteps})")
-                    lastCumulativeSteps = BridgePolicy.NO_STEP_BASELINE
-                    baselineEpochDay = today
-                }
-                BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
-            }
+    private fun methodNotAllowed(allow: String) =
+        IngestOutcome(
+            405, "Method Not Allowed",
+            """{"status":"method_not_allowed","code":405,"allow":"$allow"}"""
+        )
 
-            val writtenCount = healthManager.writeTelemetryPayload(payload, advance.delta)
+    private fun rejected(action: String) =
+        IngestOutcome(
+            400, "Bad Request",
+            JSONObject().put("status", "rejected").put("code", 400).put("action", action).toString()
+        )
 
-            if (advance.delta > 0 && writtenCount <= 0) {
-                // Health Connect accepted nothing, so do not consume the delta: keep the
-                // previous baseline and say so, rather than losing the steps silently.
-                logEvent(
-                    "Health Connect unavailable — retaining ${advance.delta} step(s) for retry"
-                )
-            } else {
-                synchronized(stepBaselineLock) {
-                    val today = LocalDate.now().toEpochDay()
-                    if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
-                        advance.baseline != BridgePolicy.NO_STEP_BASELINE
-                    ) {
-                        logEvent("Step baseline established at ${advance.baseline}")
-                    }
-                    lastCumulativeSteps = advance.baseline
-                    baselineEpochDay = today
-                    persistStepBaseline(this, advance.baseline, today)
-                }
-            }
+    /**
+     * A command the dispatcher could not match is a client error, not a success.
+     * `/control` used to answer `{"status":"executed"}` for commands it had explicitly
+     * ignored, so a client checking only `status` believed the command ran.
+     */
+    private fun handleControlRequest(body: String): IngestOutcome {
+        val json = runCatching { JSONObject(body.ifEmpty { "{}" }) }.getOrNull()
+            ?: return rejected("Malformed JSON body")
+        val command = json.optString("command", "")
+        if (command.isBlank()) return rejected("Missing \"command\" field")
 
-            _telemetry.update { cur ->
-                cur.copy(
-                    heartRateBpm = if (payload.heartRate > 0) payload.heartRate else cur.heartRateBpm,
-                    stepsToday = if (payload.steps >= 0) payload.steps else cur.stepsToday,
-                    distanceMeters = if (payload.distanceMeters >= 0) payload.distanceMeters else cur.distanceMeters,
-                    activeKcal = if (payload.activeCalories >= 0) payload.activeCalories else cur.activeKcal,
-                    spo2Percent = if (payload.spo2 >= 0) payload.spo2 else cur.spo2Percent,
-                    floorsClimbed = if (payload.floorsClimbed >= 0) payload.floorsClimbed else cur.floorsClimbed,
-                    hrvRmssdMs = if (payload.hrvMs > 0) payload.hrvMs else cur.hrvRmssdMs,
-                    restingHrBpm = if (payload.restingHeartRate > 0) payload.restingHeartRate else cur.restingHrBpm,
-                    respiratoryRateBrpm = if (payload.respiratoryRate > 0) payload.respiratoryRate else cur.respiratoryRateBrpm,
-                    sleepMinutes = if (payload.sleepMinutes >= 0) payload.sleepMinutes else cur.sleepMinutes,
-                    batteryPercent = if (payload.battery in 0..100) payload.battery else cur.batteryPercent,
-                    healthConnectSyncedCount = cur.healthConnectSyncedCount + writtenCount
-                )
-            }
-            logEvent("Webhook committed $writtenCount Health Connect records")
-        } catch (e: Exception) {
-            logEvent("Webhook JSON Error: ${e.message}")
+        val result = controlDispatcher.executeCommand(command)
+        _telemetry.update { current -> current.copy(lastControlAction = result) }
+        if (PixelControlDispatcher.isUnknownCommand(result)) {
+            logEvent("Watch Control rejected → $result")
+            return rejected(result)
         }
+        logEvent("Watch Control → $result")
+        return ok(
+            JSONObject().put("status", "executed").put("action", result).toString()
+        )
+    }
+
+    private suspend fun processWebhookTelemetryJson(rawBody: String): IngestOutcome {
+        // A malformed body is a client bug and must not be acknowledged as a success.
+        // Before this, `{not json` was answered `200 {"status":"synced"}` because the
+        // non-strict parser turned any failure into an empty payload.
+        val payload = WebhookPayloadParser.parseOrNull(rawBody)
+            ?: run {
+                logEvent("Webhook rejected: body is not a JSON object (${rawBody.length} bytes)")
+                return IngestOutcome(
+                    400, "Bad Request",
+                    """{"status":"bad_request","code":400,"message":"Body must be a JSON object"}"""
+                )
+            }
+
+        // Publish the display state FIRST. What arrived over the network is true whether
+        // or not Health Connect is able to store it, and the dashboard is the only place
+        // the user can see that data arrived at all. This update used to run after the
+        // write, so a single write failure discarded it: with Health Connect permission
+        // ungranted the dashboard stayed at 0 BPM / 0 steps while the sender was told the
+        // data had been stored. Values are filtered through the same ranges the write
+        // layer enforces, so a rejected reading cannot appear on screen either.
+        _telemetry.update { cur ->
+            cur.copy(
+                heartRateBpm = payload.heartRate
+                    .takeIf(HealthMetricRanges::isValidHeartRate) ?: cur.heartRateBpm,
+                stepsToday = if (payload.steps >= 0) payload.steps else cur.stepsToday,
+                distanceMeters = payload.distanceMeters
+                    .takeIf(HealthMetricRanges::isValidDistance) ?: cur.distanceMeters,
+                activeKcal = payload.activeCalories
+                    .takeIf(HealthMetricRanges::isValidActiveCalories) ?: cur.activeKcal,
+                spo2Percent = payload.spo2
+                    .takeIf(HealthMetricRanges::isValidSpo2) ?: cur.spo2Percent,
+                floorsClimbed = payload.floorsClimbed
+                    .takeIf(HealthMetricRanges::isValidFloors) ?: cur.floorsClimbed,
+                hrvRmssdMs = payload.hrvMs
+                    .takeIf(HealthMetricRanges::isValidHrv) ?: cur.hrvRmssdMs,
+                restingHrBpm = payload.restingHeartRate
+                    .takeIf(HealthMetricRanges::isValidRestingHeartRate) ?: cur.restingHrBpm,
+                respiratoryRateBrpm = payload.respiratoryRate
+                    .takeIf(HealthMetricRanges::isValidRespiratoryRate) ?: cur.respiratoryRateBrpm,
+                sleepMinutes = payload.sleepMinutes
+                    .takeIf(HealthMetricRanges::isValidSleepMinutes) ?: cur.sleepMinutes,
+                batteryPercent = payload.battery
+                    .takeIf(HealthMetricRanges::isValidBattery) ?: cur.batteryPercent
+            )
+        }
+
+        if (payload.controlCommand.isNotBlank()) {
+            val res = controlDispatcher.executeCommand(payload.controlCommand)
+            _telemetry.update { current -> current.copy(lastControlAction = res) }
+        }
+
+        // Read-compute under one lock: with up to 8 handlers in flight, two webhooks could
+        // otherwise both advance the baseline from the same stale value, dropping or
+        // double-counting a delta.
+        //
+        // The baseline is NOT committed here. Committing it before the Health Connect
+        // write meant a failed write consumed the delta, so steps accrued during an outage
+        // were unrecoverable (and, being persisted, survived a restart).
+        val advance = synchronized(stepBaselineLock) {
+            val today = LocalDate.now().toEpochDay()
+            if (baselineEpochDay != today) {
+                logEvent("Step baseline reset for a new day (was $lastCumulativeSteps)")
+                lastCumulativeSteps = BridgePolicy.NO_STEP_BASELINE
+                baselineEpochDay = today
+            }
+            BridgePolicy.advanceStepBaseline(lastCumulativeSteps, payload.steps)
+        }
+
+        val writtenCount = try {
+            healthManager.writeTelemetryPayload(payload, advance.delta)
+        } catch (e: Exception) {
+            // Classify honestly: a permission problem is the user's to fix and a retry
+            // will not help, so it must not be reported as a transient failure — and a
+            // write failure must never be logged as a JSON error.
+            if (isPermissionDenied(e)) {
+                logEvent("Health Connect permission denied — grant it on this device: ${e.message}")
+                return IngestOutcome(
+                    403, "Forbidden",
+                    """{"status":"error","code":"HEALTH_PERMISSION_DENIED",""" +
+                        """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+                )
+            }
+            logEvent("Health Connect write error: ${e.javaClass.simpleName}: ${e.message}")
+            return IngestOutcome(
+                503, "Service Unavailable",
+                """{"status":"error","code":"HEALTH_WRITE_FAILED",""" +
+                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+            )
+        }
+
+        // Health Connect absent returns 0 without throwing. Tell the client to retry
+        // rather than acknowledging data that was never stored.
+        if (!healthManager.isAvailable && (advance.delta > 0 || payload.hasWritableHealthMetric())) {
+            logEvent(
+                "Health Connect unavailable — retaining ${advance.delta} step(s) for retry"
+            )
+            return IngestOutcome(
+                503, "Service Unavailable",
+                """{"status":"error","code":"HEALTH_CONNECT_UNAVAILABLE",""" +
+                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+            )
+        }
+
+        // Commit the baseline only now that the write has happened.
+        synchronized(stepBaselineLock) {
+            val today = LocalDate.now().toEpochDay()
+            if (lastCumulativeSteps == BridgePolicy.NO_STEP_BASELINE &&
+                advance.baseline != BridgePolicy.NO_STEP_BASELINE
+            ) {
+                logEvent("Step baseline established at ${advance.baseline}")
+            }
+            lastCumulativeSteps = advance.baseline
+            baselineEpochDay = today
+            persistStepBaseline(this, advance.baseline, today)
+        }
+
+        val total = _telemetry.updateAndGet { cur ->
+            cur.copy(healthConnectSyncedCount = cur.healthConnectSyncedCount + writtenCount)
+        }.healthConnectSyncedCount
+        logEvent("Webhook committed $writtenCount Health Connect records")
+        return ok("""{"status":"synced","hcTotal":$total,"hcWritten":$writtenCount}""")
+    }
+
+    /** A permission refusal is the user's to fix; a retry alone will not help. */
+    private fun isPermissionDenied(e: Throwable): Boolean {
+        var cause: Throwable? = e
+        while (cause != null) {
+            if (cause is SecurityException) return true
+            val message = cause.message ?: ""
+            if (message.contains("permission", ignoreCase = true) &&
+                message.contains("health", ignoreCase = true)
+            ) {
+                return true
+            }
+            if (message.contains("SecurityException", ignoreCase = true)) return true
+            cause = cause.cause
+        }
+        return false
     }
 
     private fun startPeriodicHealthConnectFlush() {
