@@ -60,6 +60,15 @@ class WatchBridgeServiceTest {
         WatchBridgeService.clearPersistedStepBaseline(context)
     }
 
+    /**
+     * Tears the shared listener down after every test.
+     *
+     * Without this, a test that fails before its own cleanup leaves both the listener and any
+     * installed test sink in place. The next test then reuses a service whose health sink is
+     * a fake from the previous test, which is how "a failed write does not consume the step
+     * delta" and the concurrency test both failed on CI while passing locally in a different
+     * order. Test order must not be load-bearing.
+     */
     @After
     fun tearDown() {
         stopBridge()
@@ -588,8 +597,6 @@ class WatchBridgeServiceTest {
         val state = WatchBridgeService.telemetry.value
         assertEquals("the dashboard must reflect the received heart rate", 72, state.heartRateBpm)
         assertEquals("battery is never written to Health Connect, so it must always display", 62, state.batteryPercent)
-
-        stopBridge()
     }
 
     @Test
@@ -599,10 +606,15 @@ class WatchBridgeServiceTest {
         bridge!!.overrideHealthSinkForTest(sink)
 
         // 1. A successful sync establishes the baseline.
-        val first = postTelemetry("""{"steps":5200}""")
-        assertNotNull("no response (last error: ${socketError.get()})", first)
-        assertTrue("expected 200 for a successful write, got: ${first!!.take(40)}", first.startsWith("HTTP/1.1 200"))
-        assertEquals(5200L, persistedBaseline())
+        attempt("baseline sync") {
+            val first = postTelemetry("""{"steps":5200}""")
+            assertNotNull("no response (last error: ${socketError.get()})", first)
+            assertTrue(
+                "expected 200 for a successful write, got: ${first!!.take(40)}",
+                first.startsWith("HTTP/1.1 200")
+            )
+            assertEquals(5200L, persistedBaseline())
+        }
 
         // 2. The next sync fails, so its delta must NOT be consumed.
         sink.failNext = true
@@ -626,8 +638,6 @@ class WatchBridgeServiceTest {
             sink.lastStepDelta
         )
         assertEquals(5400L, persistedBaseline())
-
-        stopBridge()
     }
 
     @Test
@@ -642,8 +652,6 @@ class WatchBridgeServiceTest {
         val state = WatchBridgeService.telemetry.value
         assertNotEquals("an impossible heart rate must not be shown as a live vital", 290, state.heartRateBpm)
         assertNotEquals("an impossible SpO2 must not be shown", 100.1, state.spo2Percent, 1e-9)
-
-        stopBridge()
     }
 
     /** A sink whose failure can be toggled, to exercise retry and delta retention. */
@@ -711,8 +719,6 @@ class WatchBridgeServiceTest {
         assertTrue("expected 200, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 200"))
         assertTrue("must report the read-back counts: $response", response.contains("\"heartRate\":3"))
         assertTrue("must report a read-back total: $response", response.contains("readBackTotal"))
-
-        stopBridge()
     }
 
     // ------------------------------------------------------------- helpers
