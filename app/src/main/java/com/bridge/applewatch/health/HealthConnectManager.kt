@@ -2,9 +2,14 @@ package com.bridge.applewatch.health
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.health.connect.HealthConnectException
+import kotlinx.coroutines.delay
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.*
+import androidx.health.connect.client.records.metadata.Device
+import androidx.health.connect.client.request.ReadRecordsRequest
+import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.response.InsertRecordsResponse
 import androidx.health.connect.client.units.*
@@ -57,6 +62,15 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
         const val MAX_ACTIVE_CALORIES = HealthMetricRanges.MAX_ACTIVE_CALORIES
         const val MAX_FLOORS = HealthMetricRanges.MAX_FLOORS
 
+        /** Pause before retrying a rate-limited chunk. */
+        internal const val RATE_LIMIT_BACKOFF_MS = 1_500L
+
+        /** Read-back sentinel: this app holds only WRITE permission for the type. */
+        const val READ_NOT_GRANTED = -1
+
+        /** Read-back sentinel: the read was attempted and failed for another reason. */
+        const val READ_FAILED = -2
+
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getWritePermission(HeartRateRecord::class),
             HealthPermission.getReadPermission(HeartRateRecord::class),
@@ -78,6 +92,24 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
             HealthPermission.getWritePermission(SleepSessionRecord::class)
         )
     }
+
+    /**
+     * Metadata for a record this app measured or ingested from a device.
+     *
+     * Every write used `Metadata.manualEntry`, which sets `recordingMethod =
+     * MANUAL_ENTRY`. Health Connect exposes that to the user and to any app that reads the
+     * data, and readers commonly distrust or filter hand-entered records to prevent typed-in
+     * step totals. These values are not typed in, so they are labelled as automatically
+     * recorded from a watch.
+     */
+    private fun deviceRecord(clientRecordId: String) = Metadata.autoRecorded(
+        Device(
+            type = Device.TYPE_WATCH,
+            manufacturer = "Apple",
+            model = "Apple Watch"
+        ),
+        clientRecordId
+    )
 
     suspend fun hasAllPermissions(): Boolean {
         val hc = client ?: return false
@@ -103,7 +135,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
             endTime = end,
             endZoneOffset = offset,
             samples = sorted,
-            metadata = Metadata.manualEntry(clientRecordId = "aw9_hr_${start.toEpochMilli()}")
+            metadata = deviceRecord("aw9_hr_${start.toEpochMilli()}")
         )
         hc.insertRecords(listOf(record))
         return 1
@@ -124,7 +156,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
             // Millisecond granularity: this is called once per HR notification carrying
             // RR intervals, and a second-granular id made two bursts in the same second
             // share one record key, so one HRV value replaced the other (D-07).
-            metadata = Metadata.manualEntry(clientRecordId = "aw9_hrv_${timestamp.toEpochMilli()}")
+            metadata = deviceRecord("aw9_hrv_${timestamp.toEpochMilli()}")
         )
         hc.insertRecords(listOf(record))
     }
@@ -177,7 +209,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = now,
                     endZoneOffset = offset,
                     samples = listOf(HeartRateRecord.Sample(now, payload.heartRate.toLong())),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hr_$stamp")
+                    metadata = deviceRecord("aw9_wh_hr_$stamp")
                 )
             )
         }
@@ -206,7 +238,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = bucketEnd,
                     endZoneOffset = bucketOffset,
                     count = stepDelta,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_steps_${stepWindowStamp}_$stepDelta")
+                    metadata = deviceRecord("aw9_steps_${stepWindowStamp}_$stepDelta")
                 )
             )
         }
@@ -219,7 +251,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = now,
                     endZoneOffset = offset,
                     distance = Length.meters(payload.distanceMeters),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_dist_$stamp")
+                    metadata = deviceRecord("aw9_dist_$stamp")
                 )
             )
         }
@@ -232,7 +264,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = now,
                     endZoneOffset = offset,
                     energy = Energy.kilocalories(payload.activeCalories),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_kcal_$stamp")
+                    metadata = deviceRecord("aw9_kcal_$stamp")
                 )
             )
         }
@@ -243,7 +275,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     time = now,
                     zoneOffset = offset,
                     percentage = Percentage(payload.spo2),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_spo2_$stamp")
+                    metadata = deviceRecord("aw9_spo2_$stamp")
                 )
             )
         }
@@ -256,7 +288,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = now,
                     endZoneOffset = offset,
                     floors = payload.floorsClimbed,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_floors_$stamp")
+                    metadata = deviceRecord("aw9_floors_$stamp")
                 )
             )
         }
@@ -267,7 +299,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     time = now,
                     zoneOffset = offset,
                     heartRateVariabilityMillis = payload.hrvMs,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_wh_hrv_$stamp")
+                    metadata = deviceRecord("aw9_wh_hrv_$stamp")
                 )
             )
         }
@@ -278,7 +310,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     time = now,
                     zoneOffset = offset,
                     beatsPerMinute = payload.restingHeartRate.toLong(),
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_rhr_$stamp")
+                    metadata = deviceRecord("aw9_rhr_$stamp")
                 )
             )
         }
@@ -289,7 +321,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     time = now,
                     zoneOffset = offset,
                     rate = payload.respiratoryRate,
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_resp_$stamp")
+                    metadata = deviceRecord("aw9_resp_$stamp")
                 )
             )
         }
@@ -306,7 +338,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                     endTime = now,
                     endZoneOffset = offset,
                     title = "Sleep (imported by AW9 Pixel Bridge)",
-                    metadata = Metadata.manualEntry(clientRecordId = "aw9_sleep_${sleepStart.epochSecond}")
+                    metadata = deviceRecord("aw9_sleep_${sleepStart.epochSecond}")
                 )
             )
         }
@@ -334,6 +366,76 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
         chunkSize: Int = BATCH_CHUNK_SIZE
     ): List<List<Record>> = if (records.isEmpty()) emptyList() else records.chunked(chunkSize)
 
+
+    /**
+     * Inserts one chunk, retrying once after a delay if the provider rate-limits us.
+     *
+     * A real multi-year Apple export is thousands of records, i.e. many consecutive
+     * `insertRecords` RPCs in a tight loop. Health Connect enforces a sliding-window rate
+     * limit per app, so later chunks can come back `ERROR_RATE_LIMIT_EXCEEDED`. Without this
+     * the import would simply stop part-way and report the remainder as failed.
+     */
+    private suspend fun insertChunkWithRateLimitRetry(
+        hc: HealthConnectClient,
+        chunk: List<Record>
+    ): Int = try {
+        insertAndCount(hc, chunk)
+    } catch (e: HealthConnectException) {
+        if (e.errorCode == HealthConnectException.ERROR_RATE_LIMIT_EXCEEDED) {
+            delay(RATE_LIMIT_BACKOFF_MS)
+            insertAndCount(hc, chunk)
+        } else {
+            throw e
+        }
+    }
+
+
+    /**
+     * Reads back how many records of each type Health Connect actually stored since [since].
+     *
+     * This exists because every previous verification stopped at "the insert call returned".
+     * The write path has been proven to submit records, but never that the provider stored
+     * them, and the two are not the same thing (an upsert replaces, a rejected record
+     * disappears silently). Used by the `GET /verify-hc` diagnostic.
+     *
+     * A count of `-1` means that type could not be read, which is itself useful: it usually
+     * means the matching READ permission was not granted.
+     */
+    override suspend fun countRecordsSince(since: Instant): Map<String, Int> {
+        val hc = client ?: return emptyMap()
+        val filter = TimeRangeFilter.between(since, Instant.now())
+        val counts = LinkedHashMap<String, Int>()
+
+        // The app deliberately holds only WRITE permission for some record types (sleep and
+        // respiratory rate), so probing a read for those always fails. Report that as
+        // "not readable" rather than as an error, so the diagnostic does not cry wolf.
+        val granted = runCatching { hc.permissionController.getGrantedPermissions() }
+            .getOrDefault(emptySet())
+
+        suspend fun <T : Record> count(label: String, type: kotlin.reflect.KClass<T>) {
+            val readPermission = HealthPermission.getReadPermission(type)
+            if (readPermission !in granted) {
+                counts[label] = READ_NOT_GRANTED
+                return
+            }
+            counts[label] = runCatching {
+                hc.readRecords(ReadRecordsRequest(type, filter, pageSize = 1_000)).records.size
+            }.getOrDefault(READ_FAILED)
+        }
+
+        count("heartRate", HeartRateRecord::class)
+        count("hrvRmssd", HeartRateVariabilityRmssdRecord::class)
+        count("steps", StepsRecord::class)
+        count("distance", DistanceRecord::class)
+        count("activeCalories", ActiveCaloriesBurnedRecord::class)
+        count("oxygenSaturation", OxygenSaturationRecord::class)
+        count("floorsClimbed", FloorsClimbedRecord::class)
+        count("restingHeartRate", RestingHeartRateRecord::class)
+        count("respiratoryRate", RespiratoryRateRecord::class)
+        count("sleep", SleepSessionRecord::class)
+        return counts
+    }
+
     suspend fun insertBatchRecords(records: List<Record>): Int {
         val hc = client ?: return 0
         if (records.isEmpty()) return 0
@@ -345,7 +447,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
         // in Health Connect while the UI reported a total failure and no count.
         splitIntoBatches(records).forEachIndexed { index, chunk ->
             try {
-                totalInserted += insertAndCount(hc, chunk)
+                totalInserted += insertChunkWithRateLimitRetry(hc, chunk)
             } catch (e: Exception) {
                 failedChunks += 1
                 if (failedChunks == 1) {

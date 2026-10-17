@@ -467,6 +467,40 @@ class WebhookPayloadParserTest {
         assertEquals(90L, WebhookPayloadParser.parse("""{"sleep_hours":1.5}""").sleepMinutes)
     }
 
+
+    @Test
+    fun `summarized sleep payloads are read from totalSleep when there is no qty`() {
+        // Health Auto Export's "Summarize Data" mode (the default for scheduled exports)
+        // reports sleep without a `qty` key at all. Reading only `qty` dropped the metric
+        // entirely and still reported the import as a success.
+        val summarized = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"sleep_analysis","units":"hr",
+                 "data":[{"date":"2026-10-17 00:00:00 -0700","totalSleep":7.45,
+                          "asleep":6.8,"inBed":7.9}]}]}}"""
+        )
+        assertEquals(
+            "7.45 hours must become 447 minutes",
+            447L,
+            summarized.sleepMinutes
+        )
+
+        // `asleep` is the fallback when `totalSleep` is absent.
+        val asleepOnly = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"sleep_analysis","units":"hr",
+                 "data":[{"date":"2026-10-17 00:00:00 -0700","asleep":6.5}]}]}}"""
+        )
+        assertEquals(390L, asleepOnly.sleepMinutes)
+    }
+
+    @Test
+    fun `a regular quantity still wins over the sleep totals`() {
+        val both = WebhookPayloadParser.parse(
+            """{"data":{"metrics":[{"name":"sleep_analysis","units":"hr",
+                 "data":[{"qty":8.0,"totalSleep":7.0}]}]}}"""
+        )
+        assertEquals("qty is authoritative when present", 480L, both.sleepMinutes)
+    }
+
     @Test
     fun `distance and energy honour the exporter's units`() {
         // Health Auto Export's unit preferences are per-metric, so a mi/kJ payload must

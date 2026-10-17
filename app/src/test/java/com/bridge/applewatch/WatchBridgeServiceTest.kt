@@ -669,6 +669,52 @@ class WatchBridgeServiceTest {
         override suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant) = Unit
     }
 
+
+    @Test
+    fun `a retryable failure carries a Retry-After hint`() {
+        // A client that sees 503 should be told how long to wait rather than guessing or
+        // hammering the server. Observed on device as 503 HEALTH_CONNECT_UNAVAILABLE.
+        val response = postTelemetry("""{"heartRate":72}""")
+        assertNotNull("no response (last error: ${socketError.get()})", response)
+        assertTrue("expected 503, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 503"))
+        assertTrue(
+            "a retryable failure must advertise Retry-After: $response",
+            response.contains("Retry-After:")
+        )
+    }
+
+    @Test
+    fun `verify-hc reports what the provider stored`() {
+        startBridgeIfNeeded()
+        bridge!!.overrideHealthSinkForTest(
+            object : HealthDataSink {
+                override val isAvailable = true
+                override suspend fun writeTelemetryPayload(
+                    payload: WebhookTelemetryPayload,
+                    stepDelta: Long,
+                    now: Instant
+                ): Int = 0
+
+                override suspend fun flushHeartRateSamples(
+                    samples: List<androidx.health.connect.client.records.HeartRateRecord.Sample>
+                ): Int = 0
+
+                override suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant) = Unit
+
+                override suspend fun countRecordsSince(since: Instant): Map<String, Int> =
+                    mapOf("heartRate" to 3, "steps" to 1)
+            }
+        )
+
+        val response = rawRequest("GET /verify-hc HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        assertNotNull("no response (last error: ${socketError.get()})", response)
+        assertTrue("expected 200, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 200"))
+        assertTrue("must report the read-back counts: $response", response.contains("\"heartRate\":3"))
+        assertTrue("must report a read-back total: $response", response.contains("readBackTotal"))
+
+        stopBridge()
+    }
+
     // ------------------------------------------------------------- helpers
 
 

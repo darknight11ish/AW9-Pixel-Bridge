@@ -29,4 +29,10 @@ interface HealthDataSink {
     suspend fun flushHeartRateSamples(samples: List<HeartRateRecord.Sample>): Int
 
     suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant = Instant.now())
+
+    /**
+     * Reads back how many records of each type the provider actually stored since [since].
+     * Defaults to empty so test doubles need not implement it.
+     */
+    suspend fun countRecordsSince(since: Instant): Map<String, Int> = emptyMap()
 }
