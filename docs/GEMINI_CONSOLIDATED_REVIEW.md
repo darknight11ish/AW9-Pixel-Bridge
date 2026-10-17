@@ -47,7 +47,7 @@ tests, because the test environment could not make the health-write call fail.
 | Platform | Android 14+ (`minSdk 34`, `targetSdk 35`); watchOS 10 companion |
 | Stack | Kotlin, Jetpack Compose, Health Connect `connect-client:1.1.0`, Gradle 8.11.1, AGP 8.9.1, JDK 17 |
 | Releases | `v1.2.0`, `v1.2.1`, `v1.2.2`, `v1.2.3` — all published with `app-debug.apk` and `app-release.apk` |
-| Current source | `main` at the `v1.2.5` merge / tag `v1.2.5` |
+| Current source | `main` at `a16f968` / tag `v1.2.6` |
 | Final state | **130 unit tests**, Android Lint **0 errors**, both CI jobs green, working tree clean |
 
 ### 2.1 Release ledger (all verified from the GitHub API, not from notes)
@@ -59,7 +59,8 @@ tests, because the test environment could not make the health-write call fail.
 | `v1.2.2` | `d9860c7` | 2026-10-16 20:57 | 2,518,256 B | 115 |
 | `v1.2.3` | `c753132` | 2026-10-17 07:57 | 2,534,644 B | 125 |
 | `v1.2.4` | `aa19108` | 2026-10-17 09:38 | 2,534,644 B | 130 |
-| `v1.2.5` | `0da58e9` | 2026-10-17 10:34 | see release | 130 |
+| `v1.2.5` | `0da58e9` | 2026-10-17 10:34 | 2,534,644 B | 130 |
+| `v1.2.6` | `a16f968` | 2026-10-17 18:56 | 2,534,644 B | 130 |
 
 `v1.2.1`/`v1.2.2` and `v1.2.3`/`v1.2.4` have release APKs of **identical byte length but different
 SHA-256**;
@@ -68,7 +69,7 @@ and absent at `v1.2.1`), so this is a size coincidence, not a mis-published arti
 
 ### 2.2 Codebase metrics
 
-56 tracked files, 1,375,665 bytes, 20,472 lines (reproducible via `scripts/verify_repo_metrics.py`).
+56 tracked files, 1,387,418 bytes, 20,662 lines (reproducible via `scripts/verify_repo_metrics.py`).
 
 ---
 
@@ -626,3 +627,86 @@ use (§14.3), and this round extends the pattern to the last step of the pipelin
 signing and publishing are not the same as shipping.** A release artifact has properties —
 signature, upgrade path, installability — that exist only when it is installed over an existing
 one, and none of the four earlier mechanisms ever did that.
+
+---
+
+## 16. `v1.2.6` — value-level verification on hardware, and three more defects
+
+With every permission granted on the OnePlus 10T, the read-back diagnostic made it possible to
+check **stored values**, not just record counts. Three defects surfaced, one of them in that
+diagnostic itself.
+
+### 16.1 The read-back diagnostic was silently truncating
+
+`GET /verify-hc` used `readRecords`, which returns **one page**. A 5,000-record XML import was
+reported as 1,000 heart-rate and 1,000 step records. That is the same silent-truncation class
+this project keeps finding — this time inside the tool built to catch it.
+
+```
+before pagination: heartRate 1000, steps 1000      (wrong)
+after  pagination: heartRate 3010, steps 2005      (3000 + 2000 imported, plus live)
+```
+
+It now follows `pageToken` to exhaustion, capped at 50,000 records to bound memory.
+
+### 16.2 The window was fixed at one hour, hiding every import
+
+An XML import writes **historical** records, so it fell outside the diagnostic's one-hour
+window: the app reported `Imported 5000 of 5000` while read-back showed nothing at all. It now
+accepts `?hours=N` (1..8760), default 1.
+
+### 16.3 The service did not start when permissions were granted from Settings
+
+The foreground service was started **only** from the permission-dialog callback. Granting the
+Bluetooth permissions in system Settings while the app was alive did nothing: the app logged
+`Bluetooth permissions required to start Foreground Service` and the HTTP server never bound
+until the process was killed and reopened. This is not hypothetical — it happened during this
+session, and it is why the device appeared broken after permissions were granted.
+
+The check is now a single helper called from the dialog callback **and** from `ON_RESUME`,
+which also refreshes the auth-token badge and the Health Connect authorisation state.
+**Verified on the device:** with the runtime permissions granted while the app sat in the
+background, reopening it brought `:8484` up and the service went foreground.
+
+### 16.4 Value-level confirmation, which had never been possible before
+
+| Check | Result |
+|---|---|
+| Step delta correctness | cumulative 1000 then 1500 stored **one** record with `totals.steps = 500`, not 1500 |
+| Values land exactly | distance `3100 m`, calories `355 kcal`, floors `9` |
+| Out-of-range guard | heart rate 290 → no record created, dashboard unchanged at 68 |
+| XML import idempotency | a second identical import changed **nothing** (same deterministic ids) |
+| Webhook idempotency | two identical deliveries added **500 m** of duplicate distance — the documented Q3 tradeoff, now measured |
+| 5,000-record import | all ten chunks completed, **no rate limiting observed** at this size |
+| Auth matrix | 401 without token, 200 with it, 401 with a wrong one; `/status` and `/verify-hc` both protected; token-in-body accepted; CORS preflight 204 |
+
+### 16.5 Test isolation was load-bearing
+
+The first `v1.2.6` release build failed two tests that had **just passed on the PR**. The cause
+was not timing: `WatchBridgeServiceTest` shares one service through a `bridge` field, and the
+sink-override tests install a fake `HealthDataSink` on it. Cleanup was a trailing
+`stopBridge()` *inside* each test, so a test failing earlier left both the listener and its
+fake sink installed, and the next test ran against another test's double. **Test order was
+load-bearing.**
+
+Fixed with an `@After` that tears the listener down after every test, plus retry on the one
+request that lacked it. Six consecutive local runs green.
+
+This is the third time in this document that a green suite turned out to be green for the wrong
+reason (§5.2's stale test name, §6's stubbed XML parser, and now order-dependent state).
+
+### 16.6 A correction to an earlier guess
+
+After the first uninstall in §15 I noted that read-back showed zero and suggested uninstalling
+had deleted the Health Connect records. That was wrong: the read-back window was still one
+hour, and the records were simply outside it. Two uninstalls later the full history is intact
+(`totals.steps = 52,721`). Health Connect retained the data.
+
+### 16.7 One more release-pipeline check
+
+`v1.2.0` through `v1.2.6` all publish `app-release.apk` at exactly 2,534,644 bytes for the four
+most recent. That looked like a caching bug, so it was checked rather than assumed: each tag was
+confirmed to contain its own code, and the SHA-256 digests differ across every release. The
+identical length is a coincidence of ZIP compression, not a re-published artifact. The
+published `v1.2.6` was additionally verified to carry `versionCode 11` and the stable certificate
+`d1c16028…`.
