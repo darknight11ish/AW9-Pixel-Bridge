@@ -58,11 +58,24 @@ object WebhookPayloadParser {
      * Parses any supported `/telemetry` body. Never throws: a blank, truncated or
      * non-JSON body returns the default payload.
      */
-    fun parse(rawJson: String): WebhookTelemetryPayload {
-        if (rawJson.isBlank()) return WebhookTelemetryPayload()
+    /**
+     * Parses a webhook body, returning `null` when it is not a usable JSON object.
+     *
+     * The HTTP layer needs to distinguish "the sender posted `{}`" (a valid, empty
+     * telemetry payload) from "the sender posted `{not json`" (a client bug). The
+     * non-strict [parse] cannot express that difference: it returns a default payload for
+     * both, which is why a malformed body used to be acknowledged as a success.
+     */
+    fun parseOrNull(rawJson: String): WebhookTelemetryPayload? {
+        if (rawJson.isBlank()) return null
+        val root = runCatching { JSONObject(rawJson) }.getOrNull() ?: return null
+        return fromRoot(root)
+    }
 
-        val root = runCatching { JSONObject(rawJson) }.getOrNull()
-            ?: return WebhookTelemetryPayload()
+    fun parse(rawJson: String): WebhookTelemetryPayload =
+        parseOrNull(rawJson) ?: WebhookTelemetryPayload()
+
+    private fun fromRoot(root: JSONObject): WebhookTelemetryPayload {
 
         val control = resolveControlCommand(root)
 

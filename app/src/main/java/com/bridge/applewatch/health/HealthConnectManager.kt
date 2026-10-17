@@ -13,7 +13,7 @@ import com.bridge.applewatch.service.BridgePolicy
 import java.time.Instant
 import java.time.ZoneOffset
 
-class HealthConnectManager(context: Context) {
+class HealthConnectManager(private val context: Context) : HealthDataSink {
 
     /**
      * Null when Health Connect is not installed, disabled, or needs an update (D-08).
@@ -28,7 +28,7 @@ class HealthConnectManager(context: Context) {
         }
 
     /** True when the on-device Health Connect provider is usable. */
-    val isAvailable: Boolean get() = client != null
+    override val isAvailable: Boolean get() = client != null
 
     companion object {
         /**
@@ -38,7 +38,7 @@ class HealthConnectManager(context: Context) {
         const val BATCH_CHUNK_SIZE = 500
 
         /** Upper bound on a plausible sleep duration, in minutes (72 hours). */
-        const val MAX_SLEEP_MINUTES = 72L * 60L
+        const val MAX_SLEEP_MINUTES = HealthMetricRanges.MAX_SLEEP_MINUTES
 
         /**
          * Upper bounds imposed by Health Connect's own record constructors.
@@ -51,11 +51,11 @@ class HealthConnectManager(context: Context) {
          * batch and lost every valid record alongside it. Each metric is therefore
          * range-checked here, before construction.
          */
-        const val MAX_HRV_MS = 200.0
-        const val MAX_STEPS = 1_000_000L
-        const val MAX_DISTANCE_METERS = 1_000_000.0
-        const val MAX_ACTIVE_CALORIES = 1_000_000.0
-        const val MAX_FLOORS = 1_000_000.0
+        const val MAX_HRV_MS = HealthMetricRanges.MAX_HRV_MS
+        const val MAX_STEPS = HealthMetricRanges.MAX_STEPS
+        const val MAX_DISTANCE_METERS = HealthMetricRanges.MAX_DISTANCE_METERS
+        const val MAX_ACTIVE_CALORIES = HealthMetricRanges.MAX_ACTIVE_CALORIES
+        const val MAX_FLOORS = HealthMetricRanges.MAX_FLOORS
 
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getWritePermission(HeartRateRecord::class),
@@ -89,7 +89,7 @@ class HealthConnectManager(context: Context) {
         }
     }
 
-    suspend fun flushHeartRateSamples(samples: List<HeartRateRecord.Sample>): Int {
+    override suspend fun flushHeartRateSamples(samples: List<HeartRateRecord.Sample>): Int {
         val hc = client ?: return 0
         if (samples.isEmpty()) return 0
         val sorted = samples.sortedBy { it.time }
@@ -109,13 +109,13 @@ class HealthConnectManager(context: Context) {
         return 1
     }
 
-    suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant = Instant.now()) {
+    override suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant) {
         val hc = client ?: return
         // Must use the platform ceiling, not 250: HeartRateVariabilityRmssdRecord throws
         // IllegalArgumentException above 200 ms. This path has no try/catch and its only
         // caller launches it fire-and-forget, so an out-of-range value escaped as an
         // uncaught coroutine exception rather than a skipped record.
-        if (rmssdMs !in 1.0..MAX_HRV_MS) return
+        if (!HealthMetricRanges.isValidHrv(rmssdMs)) return
         val offset = ZoneOffset.systemDefault().rules.getOffset(timestamp)
         val record = HeartRateVariabilityRmssdRecord(
             time = timestamp,
@@ -129,10 +129,10 @@ class HealthConnectManager(context: Context) {
         hc.insertRecords(listOf(record))
     }
 
-    suspend fun writeTelemetryPayload(
+    override suspend fun writeTelemetryPayload(
         payload: WebhookTelemetryPayload,
         stepDelta: Long,
-        now: Instant = Instant.now()
+        now: Instant
     ): Int {
         val hc = client ?: return 0
         val records = buildTelemetryRecords(payload, stepDelta, now)
@@ -169,7 +169,7 @@ class HealthConnectManager(context: Context) {
         // within the same second into one record (D-07).
         val stamp = now.toEpochMilli()
 
-        if (payload.heartRate in 30..240) {
+        if (HealthMetricRanges.isValidHeartRate(payload.heartRate)) {
             records.add(
                 HeartRateRecord(
                     startTime = windowStart,
@@ -182,7 +182,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (stepDelta in 1..MAX_STEPS) {
+        if (HealthMetricRanges.isValidStepDelta(stepDelta)) {
             // Steps are interval data. Bucketing into a fixed hourly window keeps
             // Health Connect aggregation meaningful instead of turning every delta
             // into a 60-second spike (D-07b).
@@ -211,7 +211,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.distanceMeters > 0.0 && payload.distanceMeters <= MAX_DISTANCE_METERS) {
+        if (HealthMetricRanges.isValidDistance(payload.distanceMeters)) {
             records.add(
                 DistanceRecord(
                     startTime = windowStart,
@@ -224,7 +224,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.activeCalories > 0.0 && payload.activeCalories <= MAX_ACTIVE_CALORIES) {
+        if (HealthMetricRanges.isValidActiveCalories(payload.activeCalories)) {
             records.add(
                 ActiveCaloriesBurnedRecord(
                     startTime = windowStart,
@@ -237,7 +237,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.spo2 in 70.0..100.0) {
+        if (HealthMetricRanges.isValidSpo2(payload.spo2)) {
             records.add(
                 OxygenSaturationRecord(
                     time = now,
@@ -248,7 +248,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.floorsClimbed > 0.0 && payload.floorsClimbed <= MAX_FLOORS) {
+        if (HealthMetricRanges.isValidFloors(payload.floorsClimbed)) {
             records.add(
                 FloorsClimbedRecord(
                     startTime = windowStart,
@@ -261,7 +261,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.hrvMs in 1.0..MAX_HRV_MS) {
+        if (HealthMetricRanges.isValidHrv(payload.hrvMs)) {
             records.add(
                 HeartRateVariabilityRmssdRecord(
                     time = now,
@@ -272,7 +272,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.restingHeartRate in 30..150) {
+        if (HealthMetricRanges.isValidRestingHeartRate(payload.restingHeartRate)) {
             records.add(
                 RestingHeartRateRecord(
                     time = now,
@@ -283,7 +283,7 @@ class HealthConnectManager(context: Context) {
             )
         }
 
-        if (payload.respiratoryRate in 4.0..60.0) {
+        if (HealthMetricRanges.isValidRespiratoryRate(payload.respiratoryRate)) {
             records.add(
                 RespiratoryRateRecord(
                     time = now,
@@ -297,7 +297,7 @@ class HealthConnectManager(context: Context) {
         // Bounded on purpose: an unbounded value overflows `sleepMinutes * 60`
         // (Long.MAX_VALUE * 60 == -60), which would place the session's start *after*
         // its end and fail the whole insert. 72 hours is longer than any real sleep.
-        if (payload.sleepMinutes in 1..MAX_SLEEP_MINUTES) {
+        if (HealthMetricRanges.isValidSleepMinutes(payload.sleepMinutes)) {
             val sleepStart = now.minusSeconds(payload.sleepMinutes * 60)
             records.add(
                 SleepSessionRecord(

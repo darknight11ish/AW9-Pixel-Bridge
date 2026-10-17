@@ -65,7 +65,7 @@ class PixelControlDispatcher(
                 triggerCameraShutterAttempt()
                 "Camera shutter broadcast attempted (no confirmation available)"
             }
-            else -> "Ignored Unknown Command: $command"
+            else -> "$UNKNOWN_COMMAND_PREFIX: $command"
         }
     }
 
@@ -128,14 +128,25 @@ class PixelControlDispatcher(
         }
     }
 
-    private companion object {
+    companion object {
+        /** Prefix of the result returned for a command this build does not implement. */
+        const val UNKNOWN_COMMAND_PREFIX = "Ignored Unknown Command"
+
+        /**
+         * True when [outcome] came from an unhandled command, so the HTTP layer can answer
+         * with a non-success status instead of reporting the command as executed.
+         */
+        fun isUnknownCommand(outcome: String): Boolean =
+            outcome.startsWith(UNKNOWN_COMMAND_PREFIX)
+
         /** Camera intents are app-specific; there is no standard system broadcast. */
         val CAMERA_PACKAGES = listOf(
             "com.google.android.GoogleCamera",
             "com.android.camera2",
             "com.android.camera"
         )
+
         const val CAMERA_SHUTTER_ACTION = "com.google.android.camera.action.SHUTTER"
-        const val ALARM_DURATION_MS = 5_000L
+        private const val ALARM_DURATION_MS = 5_000L
     }
 }

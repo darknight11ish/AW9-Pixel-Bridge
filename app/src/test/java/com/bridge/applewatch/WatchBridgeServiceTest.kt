@@ -3,6 +3,8 @@ package com.bridge.applewatch
 import android.app.Application
 import android.content.Context
 import androidx.test.core.app.ApplicationProvider
+import com.bridge.applewatch.health.HealthDataSink
+import com.bridge.applewatch.model.WebhookTelemetryPayload
 import com.bridge.applewatch.service.BridgePolicy
 import com.bridge.applewatch.service.WatchBridgeService
 import org.junit.After
@@ -18,6 +20,7 @@ import java.io.InputStreamReader
 import java.io.PrintWriter
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.time.Instant
 import java.time.LocalDate
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
@@ -296,7 +299,7 @@ class WatchBridgeServiceTest {
     // ------------------------------------- parser wiring into the service
 
     @Test
-    fun `a Shortcuts-shaped telemetry body reaches the service state`() {
+    fun `a Shortcuts-shaped body updates the dashboard even without Health Connect`() {
         val body = """
             {"heart_rate":68,"walking_running_distance":2.4,
              "blood_oxygen_saturation":0.985,"active_energy":310.5}
@@ -304,7 +307,17 @@ class WatchBridgeServiceTest {
         attempt("Shortcuts body") {
             val response = postTelemetry(body)
             assertNotNull("no response (last error: ${socketError.get()})", response)
-            assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
+            // Health Connect cannot be constructed under Robolectric, so the honest
+            // answer is a retryable 503 — NOT the `200 {"status":"synced"}` that shipped
+            // and told clients data had been stored when nothing was written.
+            assertTrue(
+                "expected 503 when Health Connect is unavailable, got: $response",
+                response!!.startsWith("HTTP/1.1 503")
+            )
+            assertTrue(
+                "the failure must be identifiable: $response",
+                response.contains("HEALTH_CONNECT_UNAVAILABLE")
+            )
         }
 
         val state = WatchBridgeService.telemetry.value
@@ -317,14 +330,14 @@ class WatchBridgeServiceTest {
     }
 
     @Test
-    fun `a Health Auto Export body is summed and committed`() {
+    fun `a Health Auto Export body is summed and reaches the dashboard`() {
         val body = """{"data":{"metrics":[
              {"name":"heart_rate","units":"bpm","data":[{"Avg":74}]},
              {"name":"step_count","units":"count","data":[{"qty":400},{"qty":350}]}]}}"""
         attempt("Health Auto Export body") {
             val response = postTelemetry(body)
             assertNotNull("no response (last error: ${socketError.get()})", response)
-            assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
+            assertTrue("expected 503, got: $response", response!!.startsWith("HTTP/1.1 503"))
         }
 
         val state = WatchBridgeService.telemetry.value
@@ -340,14 +353,104 @@ class WatchBridgeServiceTest {
         }
         assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
 
-        // The handler swallows malformed JSON into a log line rather than letting it
-        // escape the connection, so the client still gets a response.
+        // Malformed JSON is a client bug: it must be answered 400, not acknowledged as a
+        // successful sync. It used to return `200 {"status":"synced"}` because the
+        // non-strict parser turned any parse failure into an empty payload.
         attempt("malformed body") {
             val response = postTelemetry("{definitely not json")
             assertNotNull("malformed body must still be answered (last error: ${socketError.get()})", response)
-            assertTrue("expected 200, got: $response", response!!.startsWith("HTTP/1.1 200"))
+            assertTrue("expected 400, got: $response", response!!.startsWith("HTTP/1.1 400"))
+            assertTrue("body must say why: $response", response.contains("bad_request"))
         }
+        // A rejected body must not disturb what the dashboard already shows.
         assertEquals(71, WatchBridgeService.telemetry.value.heartRateBpm)
+    }
+
+    @Test
+    fun `an empty body is rejected rather than reported as synced`() {
+        attempt("empty body") {
+            val response = postTelemetry("")
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue("expected 400, got: $response", response!!.startsWith("HTTP/1.1 400"))
+        }
+    }
+
+    // ------------------------------------------------- routing (D3 field defect)
+
+    @Test
+    fun `an unknown path is a 404 and never runs the ingest`() {
+        // The old dispatch ended in a catch-all `else` that ran the full telemetry
+        // ingest, so `GET /unknown` was answered as a successful POST. On a real device a
+        // GET carrying a JSON body reached Health Connect and attempted a write.
+        attempt("unknown path") {
+            val response = rawRequest("GET /unknown HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue("expected 404, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 404"))
+        }
+    }
+
+    @Test
+    fun `a GET to telemetry is 405 because GET must never mutate`() {
+        attempt("GET /telemetry") {
+            val response = rawRequest("GET /telemetry HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue("expected 405, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 405"))
+            assertTrue("must advertise the allowed method: $response", response.contains("POST"))
+        }
+    }
+
+    @Test
+    fun `a POST to status is 405`() {
+        attempt("POST /status") {
+            val bytes = "{}".toByteArray()
+            val response = rawRequest(
+                "POST /status HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                    "Content-Length: ${bytes.size}\r\n\r\n" + String(bytes)
+            )
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue("expected 405, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 405"))
+        }
+    }
+
+    @Test
+    fun `the root path is still a telemetry alias but only for POST`() {
+        attempt("POST /") {
+            val bytes = "{\"battery\":55}".toByteArray()
+            val response = rawRequest(
+                "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\n" +
+                    "Content-Length: ${bytes.size}\r\n\r\n" + String(bytes)
+            )
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertFalse(
+                "root must not be a 404; it is a documented alias: ${response!!.take(40)}",
+                response.startsWith("HTTP/1.1 404")
+            )
+        }
+        assertEquals(55, WatchBridgeService.telemetry.value.batteryPercent)
+    }
+
+    // ------------------------------------------------- /control honesty (D4)
+
+    @Test
+    fun `an unknown control command is a 400, not executed`() {
+        attempt("unknown command") {
+            val response = postControl("""{"command":"nonsense"}""")
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue(
+                "an ignored command must not be reported as executed: ${response!!.take(60)}",
+                response.startsWith("HTTP/1.1 400")
+            )
+            assertTrue("must be identifiable as rejected: $response", response.contains("rejected"))
+        }
+    }
+
+    @Test
+    fun `a control body with no command is a 400`() {
+        attempt("missing command") {
+            val response = postControl("""{"notACommand":true}""")
+            assertNotNull("no response (last error: ${socketError.get()})", response)
+            assertTrue("expected 400, got: ${response!!.take(40)}", response.startsWith("HTTP/1.1 400"))
+        }
     }
 
     @Test
@@ -437,9 +540,151 @@ class WatchBridgeServiceTest {
         throw AssertionError("$what failed after 3 attempts: ${lastFailure?.message}", lastFailure)
     }
 
+
+    // ------------------------------------- write-failure handling (D1 field defect)
+
+    /**
+     * The regression that matters most.
+     *
+     * On a real device with Health Connect permission ungranted, `insertRecords` threw
+     * `SecurityException`. The service answered `200 {"status":"synced"}`, the dashboard
+     * stayed at 0 BPM / 0 steps, and no test noticed, because under JVM/Robolectric the
+     * Health Connect client is `null` so the write never threw. Installing a throwing
+     * sink makes that path reachable — this is the only test that covers it.
+     */
+    @Test
+    fun `a permission refusal is answered 403 and still updates the dashboard`() {
+        startBridgeIfNeeded()
+        bridge!!.overrideHealthSinkForTest(
+            object : HealthDataSink {
+                override val isAvailable = true
+                override suspend fun writeTelemetryPayload(
+                    payload: WebhookTelemetryPayload,
+                    stepDelta: Long,
+                    now: Instant
+                ): Int = throw SecurityException(
+                    "Caller requires android.permission.health.WRITE_STEPS to write " +
+                        "record type class android.health.connect.datatypes.StepsRecord"
+                )
+
+                override suspend fun flushHeartRateSamples(
+                    samples: List<androidx.health.connect.client.records.HeartRateRecord.Sample>
+                ): Int = 0
+
+                override suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant) = Unit
+            }
+        )
+
+        val response = postTelemetry("""{"heartRate":72,"battery":62}""")
+        assertNotNull("no response (last error: ${socketError.get()})", response)
+        assertTrue(
+            "a permission refusal must not be reported as a successful sync: ${response!!.take(60)}",
+            response.startsWith("HTTP/1.1 403")
+        )
+        assertTrue("the failure must be identifiable: $response", response.contains("HEALTH_PERMISSION_DENIED"))
+
+        // What arrived over the network is still true, and this is the only place the user
+        // can see it. Before the fix this update was skipped entirely by the exception.
+        val state = WatchBridgeService.telemetry.value
+        assertEquals("the dashboard must reflect the received heart rate", 72, state.heartRateBpm)
+        assertEquals("battery is never written to Health Connect, so it must always display", 62, state.batteryPercent)
+
+        stopBridge()
+    }
+
+    @Test
+    fun `a failed write does not consume the step delta`() {
+        startBridgeIfNeeded()
+        val sink = FlakySink()
+        bridge!!.overrideHealthSinkForTest(sink)
+
+        // 1. A successful sync establishes the baseline.
+        val first = postTelemetry("""{"steps":5200}""")
+        assertNotNull("no response (last error: ${socketError.get()})", first)
+        assertTrue("expected 200 for a successful write, got: ${first!!.take(40)}", first.startsWith("HTTP/1.1 200"))
+        assertEquals(5200L, persistedBaseline())
+
+        // 2. The next sync fails, so its delta must NOT be consumed.
+        sink.failNext = true
+        val second = postTelemetry("""{"steps":5300}""")
+        assertNotNull("no response (last error: ${socketError.get()})", second)
+        assertTrue("expected 403, got: ${second!!.take(40)}", second.startsWith("HTTP/1.1 403"))
+        assertEquals(
+            "a failed write must not advance the baseline, or those 100 steps are lost",
+            5200L,
+            persistedBaseline()
+        )
+
+        // 3. Recovery: the next success writes the accumulated delta (5400 - 5200).
+        sink.failNext = false
+        val third = postTelemetry("""{"steps":5400}""")
+        assertNotNull("no response (last error: ${socketError.get()})", third)
+        assertTrue("expected 200, got: ${third!!.take(40)}", third.startsWith("HTTP/1.1 200"))
+        assertEquals(
+            "the delta must cover the steps rejected while the write was failing",
+            200L,
+            sink.lastStepDelta
+        )
+        assertEquals(5400L, persistedBaseline())
+
+        stopBridge()
+    }
+
+    @Test
+    fun `an implausible reading is never displayed`() {
+        startBridgeIfNeeded()
+        bridge!!.overrideHealthSinkForTest(FlakySink())
+
+        // A 290 bpm heart rate and a 100.1 % SpO2 are both refused by the write layer.
+        // They were still rendered on the dashboard, which is how the field test caught it.
+        postTelemetry("""{"heartRate":290,"spo2":100.1}""")
+
+        val state = WatchBridgeService.telemetry.value
+        assertNotEquals("an impossible heart rate must not be shown as a live vital", 290, state.heartRateBpm)
+        assertNotEquals("an impossible SpO2 must not be shown", 100.1, state.spo2Percent, 1e-9)
+
+        stopBridge()
+    }
+
+    /** A sink whose failure can be toggled, to exercise retry and delta retention. */
+    private class FlakySink : HealthDataSink {
+        @Volatile var failNext = false
+        @Volatile var lastStepDelta = 0L
+        override val isAvailable = true
+
+        override suspend fun writeTelemetryPayload(
+            payload: WebhookTelemetryPayload,
+            stepDelta: Long,
+            now: Instant
+        ): Int {
+            if (failNext) throw SecurityException("Caller requires android.permission.health.WRITE_STEPS")
+            lastStepDelta = stepDelta
+            return if (stepDelta > 0) 1 else 0
+        }
+
+        override suspend fun flushHeartRateSamples(
+            samples: List<androidx.health.connect.client.records.HeartRateRecord.Sample>
+        ): Int = 0
+
+        override suspend fun writeHrvRmssd(rmssdMs: Double, timestamp: Instant) = Unit
+    }
+
     // ------------------------------------------------------------- helpers
 
+
     /** POSTs a JSON body to the shared bridge listener and returns the raw response. */
+    private fun postControl(body: String): String? {
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        return rawRequest(
+            "POST /control HTTP/1.1\r\n" +
+                "Host: 127.0.0.1\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: ${bytes.size}\r\n" +
+                "\r\n" +
+                body
+        )
+    }
+
     private fun postTelemetry(body: String): String? {
         val bytes = body.toByteArray(Charsets.UTF_8)
         return rawRequest(
