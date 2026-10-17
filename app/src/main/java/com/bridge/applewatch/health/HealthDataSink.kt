@@ -35,4 +35,7 @@ interface HealthDataSink {
      * Defaults to empty so test doubles need not implement it.
      */
     suspend fun countRecordsSince(since: Instant): Map<String, Int> = emptyMap()
+
+    /** Read back the stored values, not just counts. Defaults to empty for test doubles. */
+    suspend fun totalsSince(since: Instant): Map<String, Double> = emptyMap()
 }

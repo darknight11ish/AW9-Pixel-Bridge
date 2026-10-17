@@ -71,6 +71,9 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
         /** Read-back sentinel: the read was attempted and failed for another reason. */
         const val READ_FAILED = -2
 
+        /** Cap on read-back volume, so a huge history cannot exhaust memory. */
+        private const val MAX_READ_RECORDS = 50_000
+
         val REQUIRED_PERMISSIONS = setOf(
             HealthPermission.getWritePermission(HeartRateRecord::class),
             HealthPermission.getReadPermission(HeartRateRecord::class),
@@ -401,6 +404,36 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
      * A count of `-1` means that type could not be read, which is itself useful: it usually
      * means the matching READ permission was not granted.
      */
+
+    /**
+     * Reads every record of [type] in the window, following `pageToken`.
+     *
+     * `readRecords` returns a single page (default page size 1000). Reading only the first
+     * page silently under-reports, which is exactly the failure mode this diagnostic exists
+     * to catch: an import of 3000 records was being reported as 1000.
+     */
+    private suspend fun <T : Record> readAllPages(
+        hc: HealthConnectClient,
+        type: kotlin.reflect.KClass<T>,
+        filter: TimeRangeFilter
+    ): List<T> {
+        val all = mutableListOf<T>()
+        var token: String? = null
+        do {
+            val response = hc.readRecords(
+                ReadRecordsRequest(
+                    recordType = type,
+                    timeRangeFilter = filter,
+                    pageSize = 1_000,
+                    pageToken = token
+                )
+            )
+            all += response.records
+            token = response.pageToken
+        } while (token != null && all.size < MAX_READ_RECORDS)
+        return all
+    }
+
     override suspend fun countRecordsSince(since: Instant): Map<String, Int> {
         val hc = client ?: return emptyMap()
         val filter = TimeRangeFilter.between(since, Instant.now())
@@ -419,7 +452,7 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
                 return
             }
             counts[label] = runCatching {
-                hc.readRecords(ReadRecordsRequest(type, filter, pageSize = 1_000)).records.size
+                readAllPages(hc, type, filter).size
             }.getOrDefault(READ_FAILED)
         }
 
@@ -434,6 +467,33 @@ class HealthConnectManager(private val context: Context) : HealthDataSink {
         count("respiratoryRate", RespiratoryRateRecord::class)
         count("sleep", SleepSessionRecord::class)
         return counts
+    }
+
+
+    /**
+     * Reads back the *values* the provider stored, not just how many records there are.
+     *
+     * A count proves a record exists; it does not prove the record contains the right number.
+     * The two are different failure modes, and the step path specifically needs the value
+     * checked: a cumulative counter of 5200 then 5300 must store a single record with
+     * count = 100, and a count-only check cannot tell that apart from one holding 5300.
+     */
+    override suspend fun totalsSince(since: Instant): Map<String, Double> {
+        val hc = client ?: return emptyMap()
+        val filter = TimeRangeFilter.between(since, Instant.now())
+        val totals = LinkedHashMap<String, Double>()
+
+        suspend fun <T : Record> read(type: kotlin.reflect.KClass<T>): List<T> =
+            runCatching { readAllPages(hc, type, filter) }.getOrDefault(emptyList())
+
+        totals["steps"] = read(StepsRecord::class).sumOf { it.count }.toDouble()
+        totals["distanceMeters"] = read(DistanceRecord::class).sumOf { it.distance.inMeters }
+        totals["activeKcal"] = read(ActiveCaloriesBurnedRecord::class).sumOf { it.energy.inKilocalories }
+        totals["floorsClimbed"] = read(FloorsClimbedRecord::class).sumOf { it.floors }
+        totals["sleepMinutes"] = read(SleepSessionRecord::class).sumOf {
+            java.time.Duration.between(it.startTime, it.endTime).toMinutes().toDouble()
+        }
+        return totals
     }
 
     suspend fun insertBatchRecords(records: List<Record>): Int {
