@@ -1014,6 +1014,7 @@ class WatchBridgeService : Service() {
                 // testing confirmed this was not theoretical: a GET carrying a JSON body
                 // reached Health Connect and attempted a StepsRecord write.
                 val cleanPath = path.substringBefore('?').trimEnd('/').ifEmpty { "/" }
+                val query = path.substringAfter('?', "")
                 val outcome = when (cleanPath) {
                     "/status" ->
                         if (!method.equals("GET", ignoreCase = true)) {
@@ -1039,7 +1040,7 @@ class WatchBridgeService : Service() {
                         if (!method.equals("GET", ignoreCase = true)) {
                             methodNotAllowed("GET, OPTIONS")
                         } else {
-                            verifyHealthConnect()
+                            verifyHealthConnect(query)
                         }
 
                     // "/" remains an alias for /telemetry: it is the shape the first
@@ -1156,9 +1157,21 @@ class WatchBridgeService : Service() {
     }
 
 
-    /** Reads back what Health Connect actually stored in the last hour and reports it. */
-    private suspend fun verifyHealthConnect(): IngestOutcome {
-        val since = Instant.now().minusSeconds(3_600)
+    /**
+     * Reads back what Health Connect actually stored and reports it.
+     *
+     * The window defaults to one hour because that covers live syncing, but a historical
+     * XML import writes records dated months ago, so it must be configurable
+     * (`/verify-hc?hours=720`) or an import can never be verified.
+     */
+    private suspend fun verifyHealthConnect(query: String): IngestOutcome {
+        val hours = query.split('&')
+            .firstOrNull { it.startsWith("hours=") }
+            ?.substringAfter('=')
+            ?.toIntOrNull()
+            ?.coerceIn(1, 24 * 365)
+            ?: 1
+        val since = Instant.now().minusSeconds(hours * 3_600L)
         val counts = healthManager.countRecordsSince(since)
         if (counts.isEmpty()) {
             return IngestOutcome(
@@ -1169,8 +1182,9 @@ class WatchBridgeService : Service() {
         }
         val json = JSONObject()
             .put("status", "verified")
-            .put("windowSeconds", 3_600)
+            .put("windowSeconds", hours * 3_600L)
             .put("counts", JSONObject(counts as Map<*, *>))
+            .put("totals", JSONObject(healthManager.totalsSince(since) as Map<*, *>))
             .put("readBackTotal", counts.values.filter { it > 0 }.sum())
             .put(
                 "sentinelMeaning",

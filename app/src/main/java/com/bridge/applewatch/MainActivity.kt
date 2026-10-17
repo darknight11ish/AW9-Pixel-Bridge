@@ -75,18 +75,7 @@ class MainActivity : ComponentActivity() {
                 val runtimeBleLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
                 ) { granted: Map<String, Boolean> ->
-                    val bluetoothGranted =
-                        granted[Manifest.permission.BLUETOOTH_CONNECT] == true &&
-                            granted[Manifest.permission.BLUETOOTH_SCAN] == true
-                    if (bluetoothGranted) {
-                        startForegroundService(Intent(this, WatchBridgeService::class.java))
-                    } else {
-                        // Starting a connectedDevice foreground service without these
-                        // grants throws SecurityException on API 34+ (D-03).
-                        WatchBridgeService.appendExternalLog(
-                            "Bluetooth permissions required to start Foreground Service"
-                        )
-                    }
+                    startBridgeServiceIfPermitted()
                     lifecycleScope.launch {
                         hcAuthorized = healthManager.hasAllPermissions()
                         if (!hcAuthorized) {
@@ -139,6 +128,13 @@ class MainActivity : ComponentActivity() {
                         if (event == Lifecycle.Event.ON_RESUME) {
                             lifecycleScope.launch(Dispatchers.IO) {
                                 webhookEndpoints = resolveActiveEndpoints()
+                            }
+                            // Permissions may have been granted in system Settings while this
+                            // activity was alive; retry both gates on every resume.
+                            startBridgeServiceIfPermitted()
+                            authTokenConfigured = WatchBridgeService.hasPersistedAuthToken(this@MainActivity)
+                            lifecycleScope.launch {
+                                hcAuthorized = healthManager.hasAllPermissions()
                             }
                         }
                     }
@@ -222,6 +218,33 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 WatchBridgeService.appendExternalLog("XML Import Error: ${e.message}")
             }
+        }
+    }
+
+
+    /**
+     * Starts the bridge service if the Bluetooth runtime permissions allow it.
+     *
+     * This is called from the permission-dialog callback *and* on ON_RESUME. Relying on the
+     * callback alone meant that granting the permissions from system Settings while the app
+     * was alive did nothing: the app logged "Bluetooth permissions required to start
+     * Foreground Service" and kept logging it, and the HTTP server never started until the
+     * process was killed and reopened. Field testing hit exactly that.
+     */
+    private fun startBridgeServiceIfPermitted() {
+        val bleGranted =
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED &&
+                checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (bleGranted) {
+            startForegroundService(Intent(this, WatchBridgeService::class.java))
+        } else {
+            // Starting a connectedDevice foreground service without these grants throws
+            // SecurityException on API 34+ (D-03).
+            WatchBridgeService.appendExternalLog(
+                "Bluetooth permissions required to start Foreground Service"
+            )
         }
     }
 
