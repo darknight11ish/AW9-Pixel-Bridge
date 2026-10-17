@@ -8,8 +8,10 @@ first time, after five prior rounds in which every claim was based on JVM/Robole
 questions in §9. Every claim in §5–§7 is backed by a command or log line that is reproduced so it can
 be re-run.
 
-**Status of the codebase:** `v1.2.2`, tag `v1.2.2`, commit `d9860c7`, 115 unit tests passing, Android
-Lint 0 errors, both CI jobs green. None of that changed the outcome below.
+**Status of the codebase at the time of the field test:** `v1.2.2`, tag `v1.2.2`, commit `d9860c7`,
+115 unit tests passing, Android Lint 0 errors, both CI jobs green. None of that changed the
+outcome below. **The defects in §6 are fixed in `v1.2.3`** (125 tests) and every fix was
+re-verified on the same device — see §13.
 
 ---
 
@@ -240,48 +242,120 @@ command ran. (The four commands the watch actually sends — `MEDIA_PLAY_PAUSE`,
 
 ---
 
-## 7. Environment limitation: Health Connect cannot be authorised on this device
+### D5 — MEDIUM: the dashboard displayed readings the write layer rejected
 
-This is recorded separately because it is **not** an app defect, and because it is the condition that
-exposed D1.
+Found during the re-test, not in the original field session.
 
-Observed facts:
+```
+POST /telemetry  {"heartRate":290,"spo2":100.1}   -> 200 (nothing written: out of range)
+GET  /status                                      -> {"bpm":290}
+Dashboard                                         -> "290 BPM"
+```
 
-* The Health Connect **provider** exists: `service list` → `healthconnect: [android.health.connect.aidl.IHealthConnectService]`.
-* The **controller UI** exists, but only as the APEX module
-  `com.google.android.healthconnect.controller` (`versionCode=37`).
-* The Google Health Connect **app** is absent: there is no `com.google.android.apps.healthdata`, and
-  `am start -a androidx.health.connect.action.HEALTH_HOME` → `Error: Activity not started, unable to
-  resolve Intent`.
-* Requesting permissions renders the Health Connect consent screen with **zero data types listed and
-  the "Allow" button disabled**, so permission cannot be granted:
+`buildTelemetryRecords` correctly refuses a 290 bpm record — Health Connect never sees it —
+but the display update only checked `if (payload.heartRate > 0)`, so an impossible vital was
+rendered as live data. The same applied to a 100.1 % SpO₂.
 
-  ```
-  'Allow AW9 Pixel Bridge to access Health Connect?'
-  'Choose data you want this app to read or write to Health Connect'
-  [ touch_outside       bounds=[0,107][2305,1080] ]
-  [ secondary_button  "Don't allow"  bounds=[72,927][392,1032] ]
-  [ primary_button_outline "Allow"   bounds=[2003,927][2209,1032] ]   <-- disabled
-  ```
+**Fixed in `v1.2.3`** by moving the bounds into one shared `HealthMetricRanges` object used
+by both the write layer and the display, so they cannot drift apart again. Re-verified on the
+device: `{"heartRate":290}` leaves the displayed value unchanged at 72.
 
-  Input is reaching the window (`InputDispatcher` logs the taps to `PermissionsActivity`), and the
-  `Allow` control is rendered in the *outline* (disabled) style, consistent with an empty permission
-  list rather than a missed tap.
+## 7. CORRECTED: the empty consent sheet is a Health Connect layout defect, not an app defect
 
-* The app declares all 18 health permissions in its manifest and the packaged APK carries them (checked
-  with `aapt2 dump permissions`), and it requests 18 — so this is not a missing-declaration problem.
+> **This section replaces an earlier and incorrect conclusion.** The first version of this
+> report attributed the empty Health Connect consent sheet to the absence of the
+> `com.google.android.apps.healthdata` package and called it a device limitation. An
+> independent reviewer then proposed a different cause — a missing
+> `android:permission="android.permission.START_VIEW_PERMISSION_USAGE"` on the app's
+> `VIEW_PERMISSION_USAGE` activity, which would have made it an app-side manifest defect.
+> **Both explanations are wrong**, and this section records the controlled experiment that
+> settled it.
 
-**Consequence:** every Health Connect write on this device throws
-`SecurityException: Caller requires android.permission.health.WRITE_*`. That is exactly the condition
-that exposed D1, and it will also occur on any user's device before they authorise Health Connect —
-which is a normal first-run state, not an exotic failure.
+### What was observed originally
 
-**Open question for the reviewer:** is the empty consent screen caused by the missing
-`com.google.android.apps.healthdata` package (a device/ROM state), or could an app-side mistake in how
-the permission set is requested produce an empty list? My reading is the former, but I could not
-install the Google Health Connect app on this device to prove it.
+Requesting Health Connect permission rendered a consent sheet with **no data types listed
+and a disabled "Allow" button**, so permission could not be granted by tapping:
 
----
+```
+'Allow AW9 Pixel Bridge to access Health Connect?'
+'Choose data you want this app to read or write to Health Connect'
+[ secondary_button "Don't allow" bounds=[72,927][392,1032] ]
+[ primary_button_outline "Allow" bounds=[2003,927][2209,1032] ]   <-- disabled
+```
+
+Input was reaching the window (`InputDispatcher` logged the taps against
+`PermissionsActivity`), so it was not a missed tap. The app declares all 18 health
+permissions in its manifest and the packaged APK carries them (`aapt2 dump permissions`),
+and it requests 18 — so it was not a missing-declaration problem either.
+
+### The controlled experiment
+
+The app was uninstalled (which resets Health Connect grants) and the **identical, unmodified
+`v1.2.2` APK** was reinstalled. No code was changed at any point in this comparison — only
+the device orientation was varied.
+
+**Portrait (rotation 0) — the sheet is fully populated:**
+
+```
+'Allow all'                                          enabled=true
+'Allow "AW9 Pixel Bridge" to read'                   enabled=true
+'Activity. 0 of 4 selected. Read Access'
+'Active calories burned. Read Access. Off'
+'Don't allow'                                        enabled=true
+'Allow'                                              enabled=false (nothing selected yet)
+```
+
+**Landscape (rotation 1) — on the very same dialog, the list disappears:**
+
+```
+'Allow AW9 Pixel Bridge to access Health Connect?'
+'Choose data you want this app to read or write to Health Connect'
+'If you give read access, the app can read new data and data from the past 30 days'
+'You can learn how AW9 Pixel Bridge handles your data in their privacy policy'
+'Don't allow'  enabled=true
+'Allow'        enabled=false
+```
+
+No permission rows, no "Allow all". Rotating back to portrait restores the list, so the
+effect is deterministic and reversible.
+
+### Confirmation that the dialog is fully functional
+
+In portrait, tapping **"Allow all"** then **"Allow"** granted **all 18** health permissions
+(`dumpsys package` → 18 × `granted=true`), and the app immediately wrote to Health Connect
+again:
+
+```
+POST /telemetry -> {"status":"synced","hcTotal":8}
+GET  /status    -> {"status":"online","bpm":72,"hcSynced":8}
+```
+
+Therefore:
+
+* It is **not** a missing `com.google.android.apps.healthdata` package. On Android 14+ Health
+  Connect is the `/apex/com.android.healthfitness` mainline module, and
+  `com.google.android.healthconnect.controller` is the correct package; the Play Store
+  `apps.healthdata` app is the Android 13 backport and is *expected* to be absent on
+  Android 15. The provider binder (`healthconnect: [IHealthConnectService]`) and the
+  controller are both present and working.
+* It is **not** a missing `START_VIEW_PERMISSION_USAGE` manifest attribute. The unmodified
+  APK populates the full permission list and can be granted every permission.
+* It **is** an orientation-dependent rendering defect in Health Connect's own
+  `PermissionsActivity` on this device/OEM build. Nothing in this app's code can fix it.
+
+**Residual risk worth knowing:** a user who rotates their phone to landscape while the
+consent sheet is open cannot grant permission and gets no explanation. The app cannot detect
+or work around this. It is worth reporting upstream, and it is a good argument for the app
+surfacing "Health Connect permission not granted" prominently rather than relying on the
+system dialog alone — which is exactly what `v1.2.3` now does (a `403` plus a dashboard that
+still shows the received data).
+
+### Why this matters for the earlier defect
+
+The ungranted-permission state — whether caused by this layout bug or simply by a user not
+having authorised Health Connect yet, which is the normal first-run state — is precisely the
+condition that exposed **D1**. So even though the layout defect is not the app's, the
+handling defect it uncovered is.
 
 ## 8. What could not be tested, and why
 
@@ -387,3 +461,106 @@ adb shell uiautomator dump /sdcard/ui.xml && adb pull /sdcard/ui.xml .
 Android 15 / API 35). No claim in §5–§7 is inferred: each was produced by a command whose output is
 quoted. The APK has still never run on a Pixel 9 and has still never exchanged data with a real Apple
 Watch.*
+
+---
+
+## 12. Adjudication of the external forensic review
+
+An independent reviewer produced a forensic adjudication of the first version of this report.
+It upheld D1–D4, upgraded D3 to HIGH, proposed one new defect (D0) that it rated CRITICAL,
+and proposed two further findings (D5, D6). Each claim was checked against the code and,
+where a device could settle it, against the device. Verdicts:
+
+| Claim | Reviewer's position | Verdict | Evidence |
+|---|---|---|---|
+| **D1** failed write drops state + false 200 | CRITICAL, upheld | **CONFIRMED** | Reproduced on hardware; fixed in `v1.2.3`; re-verified (§13) |
+| **D2** malformed JSON = 200 | HIGH, upheld | **CONFIRMED** | `{not json` returned `200 synced`; now `400` |
+| **D3** catch-all route ingests `GET /` | Upgraded to HIGH | **CONFIRMED, upgrade justified** | A `GET /` carrying `{"steps":9999}` was verified to attempt a `StepsRecord` write |
+| **D4** `/control` says "executed" on unknown verb | LOW, upheld | **CONFIRMED** | Returned `{"status":"executed","action":"Ignored Unknown Command: …"}`; now `400` |
+| **D0** empty HC consent sheet is an app manifest defect (missing `START_VIEW_PERMISSION_USAGE`) | Raised to CRITICAL, overturning §7 | **FALSIFIED** | Controlled A/B on the unmodified APK: the sheet is fully populated and grants all 18 permissions without that attribute. The real cause is landscape rendering (§7) |
+| **D5** `hrSampleBuffer.clear()` runs before the flush | HIGH (new) | **FALSIFIED — already fixed** | `WatchBridgeService.kt:1134` snapshots without clearing and retries; samples are removed only after a confirmed write |
+| **D6** `100.64.0.0/10` should be treated as private | LOW (new) | **NOT A DEFECT** | Deliberate and unit-tested exclusion; the peer check is defence in depth, not authentication |
+| Claimed: `pm grant` can grant health permissions | "Bonus verification" | **FALSIFIED** | `pm grant com.bridge.applewatch android.permission.health.WRITE_HEART_RATE` throws; health permissions are granted only through the Health Connect consent flow |
+| Claimed: absent `com.google.android.apps.healthdata` is a ROM defect | part of D0 reasoning | **FALSIFIED** | On Android 14+ Health Connect is the `com.android.healthfitness` APEX module; `apps.healthdata` is the Android 13 backport and is expected to be absent |
+
+### What the reviewer got right, and it mattered
+
+* **D1–D4 and the D3 severity upgrade are all correct.** The D3 upgrade especially: the
+  original report rated it MEDIUM, and demonstrating that a `GET` could drive a write makes
+  HIGH the better call.
+* **The testability recommendation was the most valuable single output of the review.** It
+  proposed extracting a `HealthDataSink` interface and installing a throwing fake so the
+  service's failure handling becomes reachable from JUnit. That is exactly what `v1.2.3`
+  does, and it is why D1 can never regress silently now: a test throws `SecurityException`
+  from the sink and asserts the `403`, the dashboard update and the step-delta retention.
+* **The recommendation to decouple the display state from the write** was correct and is
+  implemented, with one deliberate refinement: the reviewer suggested publishing state before
+  the write and keeping the *baseline* after it. That is exactly the split adopted — display
+  first, write, then commit the baseline only on success.
+
+### Where the reviewer reasoned from stale or assumed code
+
+The D5 claim describes code that does not exist in `v1.2.2`:
+
+> "Notice that `hrSampleBuffer.clear()` happens **before** `flushHeartRateSamples(copy)` is
+> called!"
+
+The shipped code, unchanged since `v1.2.1`, is:
+
+```kotlin
+// Take a snapshot but do NOT clear it yet. `flushHeartRateSamples`
+// returns 0 without throwing when Health Connect is unavailable, so
+// draining first silently discarded every sample of the interval, once
+// per 15 s, forever. Samples are removed only as they are confirmed.
+val snapshot = synchronized(hrSampleBuffer) { hrSampleBuffer.toList() }
+...
+val count = healthManager.flushHeartRateSamples(snapshot)
+if (count > 0) {
+    synchronized(hrSampleBuffer) { hrSampleBuffer.removeAll(snapshot) }
+}
+```
+
+So the defect was real *once*, was found and fixed in the previous round, and the review
+re-reported it against a version that no longer contained it. This is the failure mode to
+watch for when a reviewer works from a summary rather than from the repository.
+
+The D0 claim is the more instructive one, because the reviewer supplied a confident
+framework-level causal chain ("the APEX controller refuses to trust the rationale activity,
+filters out all 18 requested permissions, and renders the sheet with 0 permissions") and also
+*rejected* an environment explanation. Both turned out to be wrong, and a single two-minute
+experiment settled it: reinstall the unmodified APK, open the sheet in portrait, observe that
+all permissions are listed, tap "Allow all", observe all 18 granted. A plausible mechanism is
+not evidence.
+
+### Process conclusion
+
+Three independent sources were wrong about §7 in three different ways — this report (missing
+device package), the reviewer (missing manifest attribute), and the reviewer's rejection of
+the environment explanation (the actual cause). The device was right. The lesson is not
+"trust the device over reviewers"; it is that any claim about runtime behaviour should be
+cheap to test, and should be tested, before it is written into a fix directive.
+
+---
+
+## 13. `v1.2.3` verification on the same device
+
+All fixes were installed and re-tested on the OnePlus 10T before release. Health Connect
+permissions were reset by uninstalling, so both the failure and success paths could be
+exercised.
+
+| Check | Expected | Observed |
+|---|---|---|
+| `POST /telemetry`, HC permission **denied** | `403`, dashboard still updates | `HTTP 403 {"status":"error","code":"HEALTH_PERMISSION_DENIED","hcTotal":0}` and `/status` → `bpm:72` |
+| `POST /telemetry`, HC permission **granted** | `200`, records written | `HTTP 200 {"status":"synced","hcTotal":8,"hcWritten":8}` |
+| Malformed JSON | `400` | `HTTP 400 {"status":"bad_request","code":400,…}` |
+| Unknown path | `404` | `HTTP 404 {"status":"not_found","code":404,…}` |
+| `GET /telemetry` | `405` + `Allow` | `HTTP 405 {"status":"method_not_allowed","code":405,"allow":"POST, OPTIONS"}` |
+| `POST /status` | `405` | `HTTP 405 … "allow":"GET, OPTIONS"` |
+| Unknown control command | `400` rejected | `HTTP 400 {"status":"rejected","code":400,"action":"Ignored Unknown Command: nonsense"}` |
+| Valid control command | `200` executed | `HTTP 200 {"status":"executed","action":"Triggered Find My Pixel 9 Alarm (5s)"}` |
+| `{"heartRate":290}` | not displayed | displayed value stayed at 72 |
+| In-app log wording | honest attribution | `Health Connect permission denied — grant it on this device: …`, `Webhook rejected: body is not a JSON object (9 bytes)` |
+
+Test suite: **125 tests** (was 115), Android Lint 0 errors, both CI jobs green, release
+`v1.2.3` published.
+
