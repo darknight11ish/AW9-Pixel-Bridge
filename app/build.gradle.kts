@@ -11,12 +11,34 @@ android {
         applicationId = "com.bridge.applewatch"
         minSdk = 34
         targetSdk = 35
-        versionCode = 9
-        versionName = "1.2.4"
+        versionCode = 10
+        versionName = "1.2.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
             useSupportLibrary = true
+        }
+    }
+
+    /**
+     * A fixed, repository-committed signing key for the sideloadable builds.
+     *
+     * This is NOT a secret and must never be used for a Play Store upload. It exists for one
+     * reason: Android refuses to install an update signed by a different key, and Gradle's
+     * default debug keystore is generated fresh on every CI runner. Every release was
+     * therefore signed with a *different* certificate, so updating from one release to the
+     * next failed with INSTALL_FAILED_UPDATE_INCOMPATIBLE and the only way forward was to
+     * uninstall — losing the bridge token and the persisted step baseline.
+     *
+     * Using the same key in CI and locally makes successive releases upgrade in place. The
+     * password is deliberately public, because the key is public.
+     */
+    signingConfigs {
+        create("sideload") {
+            storeFile = rootProject.file("ci/sideload.keystore")
+            storePassword = "aw9sideload"
+            keyAlias = "aw9sideload"
+            keyPassword = "aw9sideload"
         }
     }
 
@@ -33,8 +55,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Sign release builds with debug config by default so CI APKs are immediately sideloadable
-            signingConfig = signingConfigs.getByName("debug")
+            // Stable key so CI and local builds are upgrade-compatible with each other.
+            signingConfig = signingConfigs.getByName("sideload")
         }
     }
 
