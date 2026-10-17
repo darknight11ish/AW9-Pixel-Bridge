@@ -543,6 +543,39 @@ class HealthConnectManagerTest {
         )
     }
 
+
+    @Test
+    fun `records are labelled as device-recorded, not hand-entered`() {
+        // Readers of Health Connect commonly distrust or filter RECORDING_METHOD_MANUAL_ENTRY
+        // to prevent users typing in fake step totals. These values are measured or
+        // ingested, so labelling them manual misrepresents every write.
+        val records = HealthConnectManager(context).buildTelemetryRecords(
+            WebhookTelemetryPayload(
+                heartRate = 72,
+                spo2 = 98.0,
+                hrvMs = 41.5,
+                restingHeartRate = 52,
+                respiratoryRate = 14.5,
+                sleepMinutes = 420,
+                distanceMeters = 7100.0,
+                activeCalories = 420.0,
+                floorsClimbed = 12.0
+            ),
+            stepDelta = 250L,
+            now = now
+        )
+
+        assertTrue("expected every writable record type", records.size >= 9)
+        records.forEach { record ->
+            assertEquals(
+                "record ${record::class.simpleName} must not be marked as manual entry",
+                androidx.health.connect.client.records.metadata.Metadata
+                    .RECORDING_METHOD_AUTOMATICALLY_RECORDED,
+                record.metadata.recordingMethod
+            )
+        }
+    }
+
     @Test
     fun `every written record type has a matching write permission requested`() {
         // A size-only assertion silently passed even when a permission was swapped for

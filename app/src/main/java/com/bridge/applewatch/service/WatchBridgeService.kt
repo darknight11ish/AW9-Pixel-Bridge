@@ -94,6 +94,9 @@ class WatchBridgeService : Service() {
          */
         private const val HTTP_PERMIT_WAIT_MS = 2_000
 
+        /** Hint for retryable failures, so clients back off deliberately. */
+        private const val RETRY_AFTER_SECONDS = 30
+
         /** Poll interval while waiting for an HTTP concurrency permit. */
         private const val PERMIT_POLL_INTERVAL_MS = 25L
 
@@ -1030,6 +1033,15 @@ class WatchBridgeService : Service() {
                             handleControlRequest(body)
                         }
 
+                    // Read-back verification: proves the provider actually stored what the
+                    // write path submitted. Every earlier check stopped at "insert returned".
+                    "/verify-hc" ->
+                        if (!method.equals("GET", ignoreCase = true)) {
+                            methodNotAllowed("GET, OPTIONS")
+                        } else {
+                            verifyHealthConnect()
+                        }
+
                     // "/" remains an alias for /telemetry: it is the shape the first
                     // release documented, and existing Shortcuts may still post to it.
                     "/telemetry", "/" ->
@@ -1045,7 +1057,10 @@ class WatchBridgeService : Service() {
                     )
                 }
 
-                writeResponse(writer, outcome.httpCode, outcome.reason, outcome.body)
+                writeResponse(
+                    writer, outcome.httpCode, outcome.reason, outcome.body,
+                    retryAfterSeconds = outcome.retryAfterSeconds
+                )
             }
         } catch (e: Exception) {
             // A malformed request, a socket timeout or a peer that vanished mid-body
@@ -1070,13 +1085,20 @@ class WatchBridgeService : Service() {
         writer.flush()
     }
 
-    private fun writeResponse(writer: PrintWriter, code: Int, reason: String, json: String) {
+    private fun writeResponse(
+        writer: PrintWriter,
+        code: Int,
+        reason: String,
+        json: String,
+        retryAfterSeconds: Int? = null
+    ) {
         writer.print(
             "HTTP/1.1 $code $reason\r\n" +
                 "Content-Type: application/json\r\n" +
                 "Access-Control-Allow-Origin: *\r\n" +
                 "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n" +
                 "$CORS_ALLOW_HEADERS\r\n" +
+                (retryAfterSeconds?.let { "Retry-After: $it\r\n" } ?: "") +
                 "Content-Length: ${json.toByteArray().size}\r\n" +
                 "Connection: close\r\n\r\n" +
                 json
@@ -1084,8 +1106,17 @@ class WatchBridgeService : Service() {
         writer.flush()
     }
 
-    /** The outcome of one HTTP request: the status to return plus its JSON body. */
-    private data class IngestOutcome(val httpCode: Int, val reason: String, val body: String)
+    /**
+     * The outcome of one HTTP request: the status to return, its JSON body, and an optional
+     * `Retry-After` hint. The hint is only set on retryable failures, so a well-behaved client
+     * can back off deliberately instead of guessing.
+     */
+    private data class IngestOutcome(
+        val httpCode: Int,
+        val reason: String,
+        val body: String,
+        val retryAfterSeconds: Int? = null
+    )
 
     private fun ok(body: String) = IngestOutcome(200, "OK", body)
 
@@ -1122,6 +1153,32 @@ class WatchBridgeService : Service() {
         return ok(
             JSONObject().put("status", "executed").put("action", result).toString()
         )
+    }
+
+
+    /** Reads back what Health Connect actually stored in the last hour and reports it. */
+    private suspend fun verifyHealthConnect(): IngestOutcome {
+        val since = Instant.now().minusSeconds(3_600)
+        val counts = healthManager.countRecordsSince(since)
+        if (counts.isEmpty()) {
+            return IngestOutcome(
+                503, "Service Unavailable",
+                """{"status":"error","code":"HEALTH_CONNECT_UNAVAILABLE"}""",
+                retryAfterSeconds = RETRY_AFTER_SECONDS
+            )
+        }
+        val json = JSONObject()
+            .put("status", "verified")
+            .put("windowSeconds", 3_600)
+            .put("counts", JSONObject(counts as Map<*, *>))
+            .put("readBackTotal", counts.values.filter { it > 0 }.sum())
+            .put(
+                "sentinelMeaning",
+                JSONObject()
+                    .put("-1", "not readable: this app holds only WRITE permission")
+                    .put("-2", "read attempted and failed")
+            )
+        return ok(json.toString())
     }
 
     private suspend fun processWebhookTelemetryJson(rawBody: String): IngestOutcome {
@@ -1210,7 +1267,8 @@ class WatchBridgeService : Service() {
             return IngestOutcome(
                 503, "Service Unavailable",
                 """{"status":"error","code":"HEALTH_WRITE_FAILED",""" +
-                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}""",
+                retryAfterSeconds = RETRY_AFTER_SECONDS
             )
         }
 
@@ -1223,7 +1281,8 @@ class WatchBridgeService : Service() {
             return IngestOutcome(
                 503, "Service Unavailable",
                 """{"status":"error","code":"HEALTH_CONNECT_UNAVAILABLE",""" +
-                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}"""
+                    """"hcTotal":${_telemetry.value.healthConnectSyncedCount}}""",
+                retryAfterSeconds = RETRY_AFTER_SECONDS
             )
         }
 

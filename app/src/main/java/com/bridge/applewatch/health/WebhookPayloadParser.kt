@@ -232,7 +232,13 @@ object WebhookPayloadParser {
         if (!avg.isNaN()) return avg
         // Shortcuts sometimes emits the raw number instead of an object field.
         val countOnly = sample.optDouble("count", Double.NaN)
-        return countOnly
+        if (!countOnly.isNaN()) return countOnly
+        // Health Auto Export's "Summarize Data" mode (the default for scheduled exports)
+        // reports sleep totals without a `qty` key at all. Reading only `qty` dropped those
+        // payloads entirely and reported the import as a success.
+        val totalSleep = sample.optDouble("totalSleep", Double.NaN)
+        if (!totalSleep.isNaN()) return totalSleep
+        return sample.optDouble("asleep", Double.NaN)
     }
 
     /** Sums incremental quantities, ignoring samples that are not numeric. */
